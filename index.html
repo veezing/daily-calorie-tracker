@@ -210,6 +210,37 @@
 const [masterDbSearch, setMasterDbSearch] = useState('');
       const [masterDbCatFilter, setMasterDbCatFilter] = useState('All');
       const [sortConfig, setSortConfig] = useState({ key: 'rowId', direction: 'asc' });
+const STAPLE_KEYS = [
+  { id: 'roti', label: 'Roti / Phulka', defaultOn: true },
+  { id: 'dal', label: 'Dal', defaultOn: true },
+  { id: 'sabzi', label: 'Green Sabzi', defaultOn: true },
+  { id: 'soya', label: 'Soya Chunks', defaultOn: true },
+  { id: 'paneer', label: 'Raw Paneer', defaultOn: true },
+  { id: 'dahi', label: 'Dahi / Curd', defaultOn: true },
+  { id: 'sattu', label: 'Sattu', defaultOn: true },
+  { id: 'milk', label: 'Milk', defaultOn: true },
+  { id: 'bread', label: 'Bread', defaultOn: false },
+  { id: 'butter', label: 'Amul Butter', defaultOn: false },
+  { id: 'cheese', label: 'Cheese Slice', defaultOn: false },
+];
+
+const [pantryStock, setPantryStock] = useState(() => {
+  const saved = localStorage.getItem('sf400_staple_stock');
+  if (saved) {
+    try { return JSON.parse(saved); } catch (e) {}
+  }
+  return STAPLE_KEYS.reduce((acc, s) => ({ ...acc, [s.id]: s.defaultOn }), {});
+});
+
+const [suggestTargetWindow, setSuggestTargetWindow] = useState('Meal 7');
+
+useEffect(() => {
+  localStorage.setItem('sf400_staple_stock', JSON.stringify(pantryStock));
+}, [pantryStock]);
+
+const toggleStaple = (id) => {
+  setPantryStock(prev => ({ ...prev, [id]: !prev[id] }));
+};
       const [selectedDbItem, setSelectedDbItem] = useState(null);
       const [inputMode, setInputMode] = useState('mass');
       const [inputValue, setInputValue] = useState('100.0');
@@ -1828,25 +1859,316 @@ ${trailingRows}
                 </div>
               </div>
 
-              {/* Balanced Evening Plate Drawer */}
-              {dailyTotals.remainingKcalRunway > 0 && (
-                <div className="mt-4 bg-slate-900 border border-slate-800 rounded-xl px-4 py-1.5">
-                  <details className="text-xs text-slate-300">
-                    <summary className="cursor-pointer font-semibold text-emerald-400 select-none">
-                      🍽 Suggest Balanced Evening Plate ({dailyTotals.remainingKcalRunway.toFixed(0)} kcal remaining)
-                    </summary>
-                    <div className="mt-2.5 mb-1 pl-2 border-l-2 border-emerald-500/50 space-y-1 text-slate-300 font-mono text-[11px]">
-                      <div>• <strong>2 Dry Rotis (~77g)</strong>: ~200 kcal | 5.2g P | 39g C</div>
-                      <div>• <strong>150g Cooked Dal</strong>: ~120 kcal | 8.0g P | 18g C</div>
-                      <div>• <strong>100g Amul Masti Dahi</strong>: ~65 kcal | 4.0g P | 4.6g C</div>
-                      <div>• <strong>35g Dry Soya Chunks</strong>: ~121 kcal | 18.2g P | 11.5g C</div>
-                      <div className="pt-1 text-emerald-300 font-sans font-bold">
-                        ➔ Total Plate: ~506 kcal | ~35.4g Protein | Clean Fuel Bridge
+      {/* Dynamic Modular Staple-Aware Evening Engine */}
+              {dailyTotals.remainingKcalRunway > 0 && (() => {
+                const remK = dailyTotals.remainingKcalRunway;
+                const remP = Math.max(0, protocolRules.proteinFloor - dailyTotals.protein);
+
+                // Safe macro extractor for any DB item handling both mass & unit modes
+                const getItemMacros = (item, qty, isUnits = false) => {
+                  if (!item) return { kcal: 0, p: 0, c: 0, f: 0, portionStr: '0g' };
+                  const isUnitMode = item.mode === 'unit';
+                  
+                  if (isUnits) {
+                    const unitG = item.unitMassG || 28.0; // fallback slice/pc weight
+                    const effectiveG = isUnitMode ? qty : (qty * unitG);
+                    const div = isUnitMode ? 1.0 : (item.baseQty || 100.0);
+                    const mult = isUnitMode ? qty : effectiveG;
+                    return {
+                      kcal: Number(((mult * item.kcal) / div).toFixed(1)),
+                      p: Number(((mult * item.protein) / div).toFixed(1)),
+                      c: Number(((mult * item.carbs) / div).toFixed(1)),
+                      f: Number(((mult * (item.fat || 0)) / div).toFixed(1)),
+                      portionStr: `${qty} pc(s)`
+                    };
+                  } else {
+                    const div = isUnitMode ? 1.0 : (item.baseQty || 100.0);
+                    return {
+                      kcal: Number(((qty * item.kcal) / div).toFixed(1)),
+                      p: Number(((qty * item.protein) / div).toFixed(1)),
+                      c: Number(((qty * item.carbs) / div).toFixed(1)),
+                      f: Number(((qty * (item.fat || 0)) / div).toFixed(1)),
+                      portionStr: `${qty} ${item.mode === '100ml' ? 'ml' : 'g'}`
+                    };
+                  }
+                };
+
+                // Dynamic matcher: finds highest protein density item matching keywords
+                const findBestFood = (keywords, excludeWords = ['matar', 'curry', 'gravy', 'tadka']) => {
+                  const matches = masterDb.filter(d => {
+                    const n = (d.name || '').toLowerCase();
+                    const hasKey = keywords.some(k => n.includes(k.toLowerCase()));
+                    const isExcluded = excludeWords.some(e => n.includes(e.toLowerCase()));
+                    return hasKey && !isExcluded;
+                  });
+                  if (matches.length === 0) return null;
+                  // Sort by protein density (highest P per kcal first)
+                  return matches.sort((a, b) => ((b.protein || 0) / (b.kcal || 1)) - ((a.protein || 0) / (a.kcal || 1)))[0];
+                };
+
+                const dbRoti = findBestFood(['phulka', 'dry roti']) || { name: 'Plain Phulka / Dry Roti', kcal: 100, protein: 2.6, carbs: 19.5, fat: 0.5, mode: 'unit', baseQty: 1 };
+                const dbDal = findBestFood(['toor dal', 'arhar', 'dal'], ['tadka']) || findBestFood(['dal']) || { name: 'Cooked Dal', kcal: 80, protein: 5.3, carbs: 12.0, fat: 1.0, mode: '100g', baseQty: 100 };
+                const dbSabzi = findBestFood(['bhindi', 'lauki', 'sabzi', 'gobhi']) || { name: 'Home Green Sabzi', kcal: 65, protein: 2.0, carbs: 7.0, fat: 3.0, mode: '100g', baseQty: 100 };
+                const dbSoya = findBestFood(['soya chunks', 'soya granules']) || { name: 'Dry Soya Chunks', kcal: 345, protein: 52.0, carbs: 33.0, fat: 0.5, mode: '100g', baseQty: 100 };
+                // Automatically selects Milky Mist High Protein Paneer if present, otherwise Raw Dairy Paneer
+                const dbPaneer = findBestFood(['paneer'], ['matar', 'curry', 'masala', 'bhurji']) || { name: 'Raw Paneer', kcal: 265, protein: 18.3, carbs: 3.5, fat: 20.0, mode: '100g', baseQty: 100 };
+                const dbDahi = findBestFood(['masti dahi', 'dahi', 'curd']) || { name: 'Amul Masti Dahi', kcal: 65, protein: 4.0, carbs: 4.6, fat: 3.5, mode: '100g', baseQty: 100 };
+                const dbSattu = findBestFood(['sattu']) || { name: 'Chana Sattu', kcal: 390, protein: 24.0, carbs: 58.0, fat: 5.0, mode: '100g', baseQty: 100 };
+                // Automatically selects Promilk if in DB, otherwise LiveLite / Toned Milk
+                const dbMilk = findBestFood(['promilk', 'high protein milk']) || findBestFood(['livelite', 'double toned', 'toned milk', 'milk']) || { name: 'Double Toned Milk', kcal: 47, protein: 3.3, carbs: 5.0, fat: 1.5, mode: '100ml', baseQty: 100 };
+                const dbBread = findBestFood(['atta bread', 'zero maida', 'brown bread', 'bread']) || { name: 'Atta Bread', kcal: 245, protein: 9.0, carbs: 46.0, fat: 2.5, mode: '100g', baseQty: 100, unitMassG: 28 };
+                const dbCheese = findBestFood(['cheese slice', 'cheese']) || { name: 'Cheese Slice', kcal: 63, protein: 3.8, carbs: 0.4, fat: 5.2, mode: 'unit', baseQty: 1 };
+                const dbButter = findBestFood(['butter', 'amul butter']) || { name: 'Amul Butter', kcal: 72, protein: 0.1, carbs: 0.1, fat: 8.0, mode: '100g', baseQty: 10 };
+
+                const cards = [];
+
+                // Helper to add calculated card
+                const pushCard = (id, title, desc, rawItems) => {
+                  let totK = 0, totP = 0, totC = 0, totF = 0;
+                  const resolvedItems = rawItems.map(it => {
+                    const m = getItemMacros(it.food, it.qty, it.isUnits);
+                    totK += m.kcal;
+                    totP += m.p;
+                    totC += m.c;
+                    totF += m.f;
+                    return { food: it.food, qty: it.qty, unit: it.isUnits ? 'pc(s)' : (it.food.mode === '100ml' ? 'ml' : 'g'), ...m };
+                  });
+                  cards.push({ id, title, desc, items: resolvedItems, totK: Number(totK.toFixed(0)), totP: Number(totP.toFixed(1)), totC: Number(totC.toFixed(1)), totF: Number(totF.toFixed(1)) });
+                };
+
+                // 1. Traditional Cooked Thali
+                if (pantryStock.roti && (pantryStock.dal || pantryStock.sabzi)) {
+                  let items = [];
+                  let kLeft = remK;
+                  const rotis = kLeft >= 400 ? 2 : 1;
+                  const rotiM = getItemMacros(dbRoti, rotis, true);
+                  items.push({ food: dbRoti, qty: rotis, isUnits: true });
+                  kLeft -= rotiM.kcal;
+
+                  if (pantryStock.dal && kLeft >= 120) {
+                    items.push({ food: dbDal, qty: 150, isUnits: false });
+                    kLeft -= getItemMacros(dbDal, 150).kcal;
+                  } else if (pantryStock.sabzi && kLeft >= 65) {
+                    items.push({ food: dbSabzi, qty: 100, isUnits: false });
+                    kLeft -= getItemMacros(dbSabzi, 100).kcal;
+                  }
+
+                  const curP = items.reduce((s, it) => s + getItemMacros(it.food, it.qty, it.isUnits).p, 0);
+                  const needP = Math.max(0, remP - curP);
+
+                  if (pantryStock.soya && needP > 3 && kLeft >= 55) {
+                    const pPerG = (dbSoya.protein || 52) / (dbSoya.baseQty || 100);
+                    const soyaG = Math.min(35, Math.max(15, Math.round((needP / pPerG) / 5) * 5));
+                    items.push({ food: dbSoya, qty: soyaG, isUnits: false });
+                  } else if (pantryStock.dahi && kLeft >= 65) {
+                    items.push({ food: dbDahi, qty: 100, isUnits: false });
+                  }
+                  pushCard('thali', 'Traditional Cooked Thali', 'Cooked grain & pulse base with targeted protein bridge', items);
+                }
+
+                // 2. High-Protein Sattu Ghol / Shake
+                if (pantryStock.sattu && (pantryStock.dahi || pantryStock.milk)) {
+                  let items = [];
+                  let kLeft = remK;
+                  const pPerG = (dbSattu.protein || 24) / (dbSattu.baseQty || 100);
+                  const sattuG = Math.min(50, Math.max(25, Math.round((remP * 0.55 / pPerG) / 5) * 5));
+                  items.push({ food: dbSattu, qty: sattuG, isUnits: false });
+                  kLeft -= getItemMacros(dbSattu, sattuG).kcal;
+
+                  if (pantryStock.dahi && kLeft >= 65) {
+                    const dahiG = kLeft >= 135 ? 200 : 100;
+                    items.push({ food: dbDahi, qty: dahiG, isUnits: false });
+                  } else if (pantryStock.milk && kLeft >= 95) {
+                    items.push({ food: dbMilk, qty: 200, isUnits: false });
+                  }
+                  pushCard('sattu', 'Sattu High-Protein Ghol', 'Rapid satiety bridge covering remaining floor gap', items);
+                }
+
+                // 3. Raw / High-Protein Paneer Plate
+                if (pantryStock.paneer) {
+                  let items = [];
+                  let kLeft = remK;
+                  const pPerG = (dbPaneer.protein || 18.3) / (dbPaneer.baseQty || 100);
+                  const kPerG = (dbPaneer.kcal || 265) / (dbPaneer.baseQty || 100);
+                  const targetG = Math.min(120, Math.max(50, Math.round((remP / pPerG) / 10) * 10));
+                  const fitG = Math.min(targetG, Math.floor(kLeft / kPerG / 10) * 10);
+
+                  if (fitG >= 40) {
+                    items.push({ food: dbPaneer, qty: fitG, isUnits: false });
+                    kLeft -= getItemMacros(dbPaneer, fitG).kcal;
+
+                    if (pantryStock.roti && kLeft >= 100) {
+                      items.push({ food: dbRoti, qty: 1, isUnits: true });
+                      kLeft -= getItemMacros(dbRoti, 1, true).kcal;
+                    }
+                    if (pantryStock.dahi && kLeft >= 65) {
+                      items.push({ food: dbDahi, qty: 100, isUnits: false });
+                    }
+                    pushCard('paneer', `Fresh Paneer Plate (${dbPaneer.name})`, 'High-density dairy protein block closing remaining floor', items);
+                  }
+                }
+
+                // 4. Lean Soya Chunks + Dairy
+                if (pantryStock.soya && (pantryStock.dahi || pantryStock.milk)) {
+                  let items = [];
+                  const pPerG = (dbSoya.protein || 52) / (dbSoya.baseQty || 100);
+                  const targetSoya = Math.min(45, Math.max(25, Math.round((remP / pPerG) / 5) * 5));
+                  items.push({ food: dbSoya, qty: targetSoya, isUnits: false });
+
+                  if (pantryStock.dahi) {
+                    items.push({ food: dbDahi, qty: 100, isUnits: false });
+                  } else if (pantryStock.milk) {
+                    items.push({ food: dbMilk, qty: 200, isUnits: false });
+                  }
+                  pushCard('soya', 'Pan-Toasted Soya Bowl', 'Max lean protein density to lock the floor with minimal calories', items);
+                }
+
+                // 5. Toast, Cheese & Protein Bridge (Correct mass & slice scaling)
+                if (pantryStock.bread && (pantryStock.cheese || pantryStock.paneer || pantryStock.milk)) {
+                  let items = [];
+                  let kLeft = remK;
+                  
+                  // 2 Slices of bread
+                  items.push({ food: dbBread, qty: 2, isUnits: true });
+                  kLeft -= getItemMacros(dbBread, 2, true).kcal;
+
+                  if (pantryStock.cheese && kLeft >= 60) {
+                    items.push({ food: dbCheese, qty: 1, isUnits: true });
+                    kLeft -= getItemMacros(dbCheese, 1, true).kcal;
+                  }
+                  if (pantryStock.butter && kLeft >= 70) {
+                    items.push({ food: dbButter, qty: 10, isUnits: false });
+                    kLeft -= getItemMacros(dbButter, 10).kcal;
+                  }
+                  if (pantryStock.milk && kLeft >= 95) {
+                    items.push({ food: dbMilk, qty: 200, isUnits: false });
+                  } else if (pantryStock.paneer && kLeft >= 130) {
+                    items.push({ food: dbPaneer, qty: 50, isUnits: false });
+                  }
+                  pushCard('toast', 'Cheese Toast & Protein Bridge', 'Warm comfort carbs backed by dairy protein and calcium', items);
+                }
+
+                // Log helper committing directly to suggestTargetWindow
+                const logMealOption = (itemsList) => {
+                  const targetWin = suggestTargetWindow || selectedMealWindow || 'Meal 7';
+                  const newLogItems = itemsList.map((it, idx) => {
+                    const isUnit = it.isUnits || it.food.mode === 'unit';
+                    const unitG = it.food.unitMassG || 28;
+                    return {
+                      id: `suggest-${Date.now()}-${idx}`,
+                      mealWindow: targetWin,
+                      name: it.food.name,
+                      refUnit: it.portionStr,
+                      massG: isUnit ? (it.food.unitMassG ? Number((it.qty * it.food.unitMassG).toFixed(1)) : null) : it.qty,
+                      units: isUnit ? it.qty : undefined,
+                      isUnit: isUnit,
+                      kcal: it.kcal,
+                      protein: it.p,
+                      carbs: it.c,
+                      fat: it.f,
+                      source: 'Auto-Plate Suggestion'
+                    };
+                  });
+
+                  updateCurrentDay(base => ({
+                    ...base,
+                    items: [...(base.items || []), ...newLogItems]
+                  }));
+                };
+
+                return (
+                  <div className="mt-4 bg-slate-900 border border-slate-800 rounded-xl px-4 py-3 space-y-3">
+                    <details className="text-xs text-slate-300" open>
+                      <summary className="cursor-pointer font-semibold text-emerald-400 select-none flex items-center justify-between">
+                        <span>🍽 Smart Evening Pairings ({remK.toFixed(0)} kcal runway | {remP > 0 ? `${remP.toFixed(1)}g P to floor` : 'Floor cleared ✓'})</span>
+                        <div className="flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
+                          <span className="text-[10px] text-slate-400 font-mono">Target Window:</span>
+                          <select
+                            value={suggestTargetWindow}
+                            onChange={(e) => setSuggestTargetWindow(e.target.value)}
+                            className="bg-slate-950 border border-slate-700 rounded px-2 py-0.5 text-[11px] text-emerald-300 font-mono cursor-pointer"
+                          >
+                            {activeMealWindows.map(w => (
+                              <option key={w.id} value={w.id}>{w.label}</option>
+                            ))}
+                          </select>
+                        </div>
+                      </summary>
+
+                      {/* STAPLES INVENTORY TOGGLE TRAY */}
+                      <div className="mt-2.5 pt-2 border-t border-slate-800/80">
+                        <div className="text-[10px] font-mono text-slate-400 uppercase tracking-wide mb-1.5">
+                          Tap items you have available right now:
+                        </div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {STAPLE_KEYS.map(staple => {
+                            const isStocked = !!pantryStock[staple.id];
+                            return (
+                              <button
+                                key={staple.id}
+                                type="button"
+                                onClick={() => toggleStaple(staple.id)}
+                                className={`px-2.5 py-1 rounded-md text-xs font-mono font-medium border transition-colors cursor-pointer ${
+                                  isStocked
+                                    ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300'
+                                    : 'bg-slate-950 border-slate-800 text-slate-500 hover:text-slate-400'
+                                }`}
+                              >
+                                {isStocked ? `✓ ${staple.label}` : staple.label}
+                              </button>
+                            );
+                          })}
+                        </div>
                       </div>
-                    </div>
-                  </details>
-                </div>
-              )}
+
+                      {/* INDEPENDENT MODULAR CARDS */}
+                      <div className="mt-3 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2.5">
+                        {cards.map((c) => (
+                          <div key={c.id} className="bg-slate-950/70 border border-slate-800 rounded-lg p-2.5 flex flex-col justify-between">
+                            <div>
+                              <div className="text-[11px] font-semibold text-sky-400 pb-0.5 border-b border-slate-800/80 flex items-center justify-between">
+                                <span>{c.title}</span>
+                              </div>
+                              <div className="text-[10px] text-slate-400 mt-1 mb-2 font-sans italic">
+                                {c.desc}
+                              </div>
+                              <div className="space-y-1 font-mono text-[11px] text-slate-300">
+                                {c.items.map((it, iIdx) => (
+                                  <div key={iIdx}>
+                                    • <strong>{it.food.name}</strong> ({it.portionStr})
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+
+                            <div className="mt-3 pt-2 border-t border-slate-800/80">
+                              <div className="text-[11px] font-bold text-emerald-300 font-mono">
+                                ~{c.totK} kcal | ~{c.totP}g P | ~{c.totC}g C
+                              </div>
+                              <div className="text-[10px] text-slate-400">
+                                {remK - c.totK >= 0 ? `${(remK - c.totK).toFixed(0)} kcal buffer under 1600` : `Absorbs in float`}
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => logMealOption(c.items)}
+                                className="mt-2 w-full py-1 rounded bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/30 text-[10px] font-mono font-bold cursor-pointer transition-colors"
+                              >
+                                + Log to {activeMealWindows.find(w => w.id === suggestTargetWindow)?.label || suggestTargetWindow}
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+
+                      {cards.length === 0 && (
+                        <div className="mt-3 text-xs text-slate-400 italic">
+                          No combinations match your active staple toggles. Turn on staples above (e.g. Sattu, Roti, Paneer, or Soya) to view pairings.
+                        </div>
+                      )}
+                    </details>
+                  </div>
+                );
+              })()}
             </section>
 
             {/* Body Tape Drawer */}
