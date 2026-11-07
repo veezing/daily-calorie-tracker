@@ -1,0 +1,2833 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#020617" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="SF-400 Ledger v5" />
+  <title>SF-400 Protocol Ledger v5.1</title>
+
+  <!-- 1. BASELINE DATABASE (database.js) -->
+  <script src="./database.js"></script>
+
+  <!-- 2. UI LIBRARIES -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<!-- GOOGLE IDENTITY SERVICES (GIS) -->
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+
+  <style>
+    body {
+      background-color: #020617;
+      color: #f1f5f9;
+      -webkit-tap-highlight-color: transparent;
+    }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #0f172a; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useMemo, useRef } = React;
+
+    const DEFAULT_DATA = window.DEFAULT_PROTOCOL_DATA || {
+      daysArchive: {},
+      viewedDayIndex: 105,
+      masterDb: [],
+      mealPresets: [],
+      protocolRules: {}
+    };
+
+    const DEFAULT_MEAL_WINDOWS = [
+      { id: 'Meal 1', label: 'Meal 1 (Early Morning)' },
+      { id: 'Meal 2', label: 'Meal 2 (Breakfast)' },
+      { id: 'Meal 3', label: 'Meal 3 (Midday Refuel)' },
+      { id: 'Meal 4', label: 'Meal 4 (Lunch)' },
+      { id: 'Meal 5', label: 'Meal 5 (Street Refuel)' },
+      { id: 'Meal 6', label: 'Meal 6 (Evening Snack)' },
+      { id: 'Meal 7', label: 'Meal 7 (Dinner)' }
+    ];
+
+    const DAY_TYPE_TAGS = [
+      'Active Fuel',
+      'Routine A',
+      'Routine B',
+      'Aerobic Road',
+      'Somatic Triage',
+      'Rest / Recovery'
+    ];
+
+    const DEFAULT_TAXONOMY = [
+      'Dals, Legumes & Curries',
+      'Breads & Bases',
+      'Vegetables & Sabzis',
+      'Fruits & Raw Salads',
+      'Street Food & Snacks',
+      'Dairy, Drinks & Condiments',
+      'Traditional Sweets & Treats',
+      'Quick Meals & Fast Food',
+      'Curated Meals',
+      'Custom Additions'
+    ];
+
+    const TDEE_MODES = [
+      { id: 'rest', label: 'Rest Baseline (2,100)', kcal: 2100 },
+      { id: 'moderate', label: 'Moderate / Track (2,450)', kcal: 2450 },
+      { id: 'kinetic', label: 'High Kinetic / Sortie (2,700)', kcal: 2700 }
+    ];
+
+    function getCalendarInfoForDay(dayIndex) {
+      const baseDate = new Date(2026, 9, 24); // Month 9 = October
+      const diff = dayIndex - 104;
+      const target = new Date(baseDate.getTime() + diff * 86400000);
+      const weekdays = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+      const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      const wDay = weekdays[target.getDay()];
+      const mName = months[target.getMonth()];
+      const dNum = target.getDate();
+      return {
+        weekday: wDay,
+        dateStr: `${wDay}, ${mName} ${dNum}`,
+        isWednesday: target.getDay() === 3,
+        defaultLabel: `${wDay}, ${mName} ${dNum} — Active Fuel`
+      };
+    }
+
+    function pruneEmptyFutureDays(archiveObj, minProtectedDay = 105) {
+      const cleaned = {};
+      Object.keys(archiveObj || {}).forEach((k) => {
+        const idx = Number(k);
+        const d = archiveObj[k];
+        if (!d) return;
+        const hasItems = Array.isArray(d.items) && d.items.length > 0;
+        const hasManual = d.manualKcal !== null && d.manualKcal !== undefined && Number(d.manualKcal) > 0;
+        const bm = d.bodyMetrics || {};
+        const hasBody = Boolean(bm.weightKg || bm.waistCm || bm.chestCm || bm.bicepCm || bm.shouldersCm || bm.thighCm);
+        const anc = d.anchors || {};
+        const hasAnchors = Boolean(anc.waterMl > 0 || anc.zeroSodaCans > 0 || anc.b12Taken || anc.d3Taken);
+        if (idx <= minProtectedDay || hasItems || hasManual || hasBody || hasAnchors) {
+          cleaned[idx] = d;
+        }
+      });
+      return cleaned;
+    }
+
+    function getDayMetrics(dayObj) {
+      if (!dayObj) return { kcal: 0, protein: 0, carbs: 0, fat: 0 };
+      if (dayObj.items && dayObj.items.length > 0) {
+        const raw = dayObj.items.reduce((acc, item) => ({
+          kcal: acc.kcal + Number(item.kcal || 0),
+          protein: acc.protein + Number(item.protein || 0),
+          carbs: acc.carbs + Number(item.carbs || 0),
+          fat: acc.fat + Number(item.fat || 0)
+        }), { kcal: 0, protein: 0, carbs: 0, fat: 0 });
+        return {
+          kcal: Number(raw.kcal.toFixed(1)),
+          protein: Number(raw.protein.toFixed(1)),
+          carbs: Number(raw.carbs.toFixed(1)),
+          fat: Number(raw.fat.toFixed(1))
+        };
+      }
+      return {
+        kcal: Number((dayObj.manualKcal || 0).toFixed(1)),
+        protein: Number((dayObj.manualProtein || 0).toFixed(1)),
+        carbs: Number((dayObj.manualCarbs || 0).toFixed(1)),
+        fat: Number((dayObj.manualFat || 0).toFixed(1))
+      };
+    }
+
+    function getDayTdee(dayObj, defaultTdee = 2450) {
+      if (!dayObj) return defaultTdee;
+      const base = Number(dayObj.tdeeBase || defaultTdee);
+      const bonus = Number(dayObj.kineticBurnKcal || 0);
+      return Number((base + bonus).toFixed(0));
+    }
+
+    function App() {
+      const fileInputRef = useRef(null);
+
+      const [daysArchive, setDaysArchive] = useState(() => {
+        const saved = localStorage.getItem('protocol_v4_archive') || localStorage.getItem('protocol_v3_archive');
+        const parsed = saved ? JSON.parse(saved) : {};
+        const merged = { ...(DEFAULT_DATA.daysArchive || {}), ...parsed };
+        return pruneEmptyFutureDays(merged, 105);
+      });
+
+      const [viewedDayIndex, setViewedDayIndex] = useState(() => {
+        const saved = localStorage.getItem('protocol_v4_viewed_day');
+        return saved ? Math.max(Number(saved), 105) : (DEFAULT_DATA.viewedDayIndex || 105);
+      });
+
+      const [masterDb, setMasterDb] = useState(() => {
+        const saved = localStorage.getItem('protocol_v4_master_db');
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (Array.isArray(parsed) && parsed.length >= 80) return parsed;
+        }
+        return DEFAULT_DATA.masterDb || [];
+      });
+
+      const [mealPresets, setMealPresets] = useState(() => {
+        const saved = localStorage.getItem('protocol_v4_presets');
+        return saved ? JSON.parse(saved) : (DEFAULT_DATA.mealPresets || []);
+      });
+
+      const [protocolRules, setProtocolRules] = useState(() => {
+        const saved = localStorage.getItem('protocol_v4_rules');
+        const defaults = {
+          nominalCeiling: 1600.0,
+          tdeeBaseline: 2450.0,
+          proteinFloor: 70.0,
+          carbBandMin: 160.0,
+          carbBandMax: 190.0,
+          carbCeiling: 200.0,
+          fatBandMin: 40.0,
+          fatBandMax: 55.0,
+          targetWeightMin: 70.0,
+          targetWeightMax: 72.0,
+          defaultRefWeightKg: 74.7,
+          baseCumulativeDay97: 161771.6,
+          enableB12Tracker: true,
+          enableD3Tracker: true
+        };
+        return saved ? { ...defaults, ...JSON.parse(saved) } : defaults;
+      });
+
+      const [activeTab, setActiveTab] = useState('dashboard');
+      const [showTapeDrawer, setShowTapeDrawer] = useState(false);
+      const [showSupplSettings, setShowSupplSettings] = useState(false);
+      const [selectedMealWindow, setSelectedMealWindow] = useState('Meal 1');
+      const [searchQuery, setSearchQuery] = useState('');
+      const [categoryFilter, setCategoryFilter] = useState('All');
+const [masterDbSearch, setMasterDbSearch] = useState('');
+      const [masterDbCatFilter, setMasterDbCatFilter] = useState('All');
+      const [sortConfig, setSortConfig] = useState({ key: 'rowId', direction: 'asc' });
+      const [selectedDbItem, setSelectedDbItem] = useState(null);
+      const [inputMode, setInputMode] = useState('mass');
+      const [inputValue, setInputValue] = useState('100.0');
+      const [pieceNote, setPieceNote] = useState('');
+      const [copiedReport, setCopiedReport] = useState(false);
+      const [lastSavedText, setLastSavedText] = useState('✓ Auto-Saved Locally');
+
+// ================================================================
+      // GOOGLE DRIVE LIVE SYNC ENGINE (appDataFolder)
+      // ================================================================
+      const GOOGLE_CLIENT_ID = '830957352948-2a5c8c2gk9tb6a6792knhgbt35qgk80d.apps.googleusercontent.com';
+
+      const [tokenClient, setTokenClient] = useState(null);
+      const [driveAccessToken, setDriveAccessToken] = useState(() => localStorage.getItem('sf400_drive_token') || null);
+      const [driveSyncStatus, setDriveSyncStatus] = useState('Disconnected');
+      const [driveFileId, setDriveFileId] = useState(() => localStorage.getItem('sf400_drive_file_id') || null);
+      const isSyncingRef = useRef(false);
+      const pendingSyncActionRef = useRef(null);
+
+      const requestFreshToken = (retryAction = null) => {
+        if (!tokenClient) return;
+        if (retryAction) pendingSyncActionRef.current = retryAction;
+        setDriveSyncStatus('Refreshing...');
+        tokenClient.requestAccessToken({ prompt: '' });
+      };
+
+      // Initialize GIS client on mount
+	      useEffect(() => {
+        const initGis = () => {
+          if (window.google && window.google.accounts && window.google.accounts.oauth2) {
+           const client = window.google.accounts.oauth2.initTokenClient({
+              client_id: GOOGLE_CLIENT_ID,
+              scope: 'https://www.googleapis.com/auth/drive.appdata',
+              callback: (tokenResponse) => {
+                if (tokenResponse && tokenResponse.access_token) {
+                  setDriveAccessToken(tokenResponse.access_token);
+                  localStorage.setItem('sf400_drive_token', tokenResponse.access_token);
+                  setDriveSyncStatus('Connected');
+                  if (pendingSyncActionRef.current) {
+                    const action = pendingSyncActionRef.current;
+                    pendingSyncActionRef.current = null;
+                    action(tokenResponse.access_token);
+                  } else {
+                    pullFromDrive(tokenResponse.access_token);
+                  }
+                }
+              },
+            });
+            setTokenClient(client);
+          } else {
+            setTimeout(initGis, 300);
+          }
+        };
+        initGis();
+      }, []);
+
+      const handleConnectDrive = () => {
+        if (!tokenClient) {
+          alert('Google Auth initializing. Please wait a moment.');
+          return;
+        }
+        tokenClient.requestAccessToken({ prompt: '' });
+      };
+
+      // Locate or create the private sync file in appDataFolder
+      const getOrCreateDriveFile = async (token) => {
+        const cachedId = driveFileId || localStorage.getItem('sf400_drive_file_id');
+        if (cachedId && cachedId !== 'undefined') return cachedId;
+
+        try {
+          const searchRes = await fetch(
+            "https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=name='sf400-live-sync.json' and trashed=false",
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
+          if (searchRes.status === 401) {
+            setDriveAccessToken(null);
+            localStorage.removeItem('sf400_drive_token');
+            setDriveSyncStatus('Disconnected');
+            return null;
+          }
+          const searchData = await searchRes.json();
+
+          if (searchData.files && searchData.files.length > 0) {
+            const id = searchData.files[0].id;
+            setDriveFileId(id);
+            localStorage.setItem('sf400_drive_file_id', id);
+            return id;
+          }
+
+          const meta = { name: 'sf400-live-sync.json', parents: ['appDataFolder'] };
+          const createRes = await fetch("https://www.googleapis.com/drive/v3/files", {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${token}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(meta)
+          });
+          if (createRes.status === 401) {
+            setDriveAccessToken(null);
+            localStorage.removeItem('sf400_drive_token');
+            setDriveSyncStatus('Disconnected');
+            return null;
+          }
+          const createData = await createRes.json();
+          if (createData.id) {
+            setDriveFileId(createData.id);
+            localStorage.setItem('sf400_drive_file_id', createData.id);
+            return createData.id;
+          }
+          return null;
+        } catch (e) {
+          return null;
+        }
+      };
+
+      // Pull latest state from Drive (Safe Parsing)
+      const pullFromDrive = async (overrideToken = null) => {
+        const token = overrideToken || driveAccessToken;
+        if (!token || isSyncingRef.current) return;
+
+        try {
+          isSyncingRef.current = true;
+          setDriveSyncStatus('Checking Drive...');
+          const fId = await getOrCreateDriveFile(token);
+	
+	if (!fId) {
+            setDriveSyncStatus('Disconnected');
+            return;
+        	  }
+
+          const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fId}?alt=media`, {
+            headers: { Authorization: `Bearer ${token}` }
+          });
+
+          if (res.status === 401) {
+            requestFreshToken((newToken) => pullFromDrive(newToken));
+            return;
+          }
+
+          if (res.ok) {
+            const text = await res.text();
+            let remoteData = null;
+            try {
+              if (text && text.trim().length > 0) {
+                remoteData = JSON.parse(text);
+              }
+            } catch (parseErr) {
+              remoteData = null;
+            }
+
+            if (remoteData && remoteData.daysArchive && Object.keys(remoteData.daysArchive).length > 0) {
+              const localUpdate = Number(localStorage.getItem('sf400_last_local_update') || 0);
+              const remoteUpdate = Number(remoteData.updatedAt || 0);
+
+              // If remote is newer, adopt remote; otherwise push local up
+              if (remoteUpdate > localUpdate) {
+                setDaysArchive(remoteData.daysArchive);
+                if (remoteData.masterDb && remoteData.masterDb.length > 0) setMasterDb(remoteData.masterDb);
+                if (remoteData.mealPresets) setMealPresets(remoteData.mealPresets);
+                if (remoteData.protocolRules) setProtocolRules(prev => ({ ...prev, ...remoteData.protocolRules }));
+                if (remoteData.viewedDayIndex) setViewedDayIndex(remoteData.viewedDayIndex);
+                localStorage.setItem('sf400_last_local_update', String(remoteUpdate));
+              } else if (localUpdate > remoteUpdate) {
+                await pushToDrive(token);
+              }
+              setDriveSyncStatus('Synced ✓');
+            } else {
+              // Remote file is empty/blank: immediately push current local dataset to establish baseline
+              await pushToDrive(token);
+            }
+          }
+        } catch (err) {
+          console.error('Drive Sync Error:', err);
+          setDriveSyncStatus('Sync Error');
+        } finally {
+          isSyncingRef.current = false;
+        }
+      };
+
+      // Push latest state to Drive
+      const pushToDrive = async (overrideToken = null) => {
+        const token = overrideToken || driveAccessToken;
+        if (!token || isSyncingRef.current) return;
+
+        try {
+          isSyncingRef.current = true;
+          setDriveSyncStatus('Saving to Drive...');
+          const fId = await getOrCreateDriveFile(token);
+	if (!fId) {
+            setDriveSyncStatus('Disconnected');
+            return;
+          }
+          const nowTs = Date.now();
+
+          const payload = {
+            version: 5,
+            updatedAt: nowTs,
+            daysArchive: pruneEmptyFutureDays(daysArchive, 105),
+            viewedDayIndex,
+            masterDb,
+            mealPresets,
+            protocolRules
+          };
+
+          const res = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fId}?uploadType=media`, {
+            method: 'PATCH',
+            headers: {
+              Authorization: `Bearer ${token}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(payload)
+          });
+
+          if (res.ok) {
+            localStorage.setItem('sf400_last_local_update', String(nowTs));
+            setDriveSyncStatus('Synced ✓');
+          } else if (res.status === 401) {
+            requestFreshToken((newToken) => pushToDrive(newToken));
+          } else {
+            setDriveSyncStatus('Upload Error');
+          }
+        } catch (err) {
+          setDriveSyncStatus('Upload Error');
+        } finally {
+          isSyncingRef.current = false;
+        }
+      };
+
+      // Debounced push on changes (2.5s)
+      useEffect(() => {
+        if (!driveAccessToken) return;
+        const timer = setTimeout(() => {
+          pushToDrive();
+        }, 2500);
+        return () => clearTimeout(timer);
+      }, [daysArchive, masterDb, mealPresets, protocolRules, driveAccessToken]);
+
+      // Auto-pull when tab becomes active / window focused
+      useEffect(() => {
+        const onVisibilityFocus = () => {
+          if (document.visibilityState === 'visible' && driveAccessToken) {
+            pullFromDrive();
+          }
+        };
+        window.addEventListener('focus', onVisibilityFocus);
+        document.addEventListener('visibilitychange', onVisibilityFocus);
+        return () => {
+          window.removeEventListener('focus', onVisibilityFocus);
+          document.removeEventListener('visibilitychange', onVisibilityFocus);
+        };
+      }, [driveAccessToken]);
+
+
+      // Phase 1 UI Toggles
+      const [showCustomAdder, setShowCustomAdder] = useState(false);
+	const [showPresets, setShowPresets] = useState(false);
+      const [showScaleLogger, setShowScaleLogger] = useState(false);
+	const [showHeaderMenu, setShowHeaderMenu] = useState(false);
+      const [showPipeDrawer, setShowPipeDrawer] = useState(false);
+      const [pipeInputText, setPipeInputText] = useState('');
+
+      // Inline DB Editing
+      const [editingRowId, setEditingRowId] = useState(null);
+      const [editDraft, setEditDraft] = useState({});
+
+      // Custom Extrapolator State
+      const [customEntry, setCustomEntry] = useState({
+        name: '',
+        rowId: 'Custom',
+        category: 'Dals, Legumes & Curries',
+        targetStorageMode: '100g', // '100g', '100ml', 'unit'
+        sourceRefQty: '100.0',
+        consumedNowQty: '100.0',
+        kcal: '',
+        protein: '',
+        carbs: '',
+        fat: '',
+        source: 'SF-400 scale verified'
+      });
+
+      useEffect(() => {
+        localStorage.setItem('protocol_v4_archive', JSON.stringify(daysArchive));
+        const now = new Date();
+        setLastSavedText(`✓ Saved ${now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`);
+      }, [daysArchive]);
+
+      useEffect(() => { localStorage.setItem('protocol_v4_viewed_day', String(viewedDayIndex)); }, [viewedDayIndex]);
+      useEffect(() => { localStorage.setItem('protocol_v4_master_db', JSON.stringify(masterDb)); }, [masterDb]);
+      useEffect(() => { localStorage.setItem('protocol_v4_presets', JSON.stringify(mealPresets)); }, [mealPresets]);
+      useEffect(() => { localStorage.setItem('protocol_v4_rules', JSON.stringify(protocolRules)); }, [protocolRules]);
+
+      const allSavedDayNumbers = useMemo(() => Object.keys(daysArchive).map(Number).sort((a, b) => a - b), [daysArchive]);
+      const minDayIndex = allSavedDayNumbers[0] || 98;
+      const calInfo = useMemo(() => getCalendarInfoForDay(viewedDayIndex), [viewedDayIndex]);
+      const isVirtualUnsavedDay = !daysArchive[viewedDayIndex];
+
+      const currentDayObj = daysArchive[viewedDayIndex] || {
+        dayIndex: viewedDayIndex,
+        label: calInfo.defaultLabel,
+        items: [],
+        mealWindows: DEFAULT_MEAL_WINDOWS,
+        manualKcal: null, manualProtein: null, manualCarbs: null, manualFat: null,
+        bodyMetrics: {},
+        anchors: { waterMl: 0, zeroSodaCans: 0, b12Taken: false, d3Taken: false },
+        tdeeBase: protocolRules.tdeeBaseline || 2450,
+        kineticBurnKcal: 0
+      };
+
+      const activeMealWindows = currentDayObj.mealWindows || DEFAULT_MEAL_WINDOWS;
+      const currentBody = currentDayObj.bodyMetrics || {};
+      const currentAnchors = currentDayObj.anchors || { waterMl: 0, zeroSodaCans: 0, b12Taken: false, d3Taken: false };
+      const currentDayTdee = getDayTdee(currentDayObj, protocolRules.tdeeBaseline);
+
+      useEffect(() => {
+        document.title = `D${viewedDayIndex} — ${currentDayObj?.label || 'Protocol'}`;
+      }, [viewedDayIndex, currentDayObj?.label]);
+
+      useEffect(() => {
+        if (!activeMealWindows.some(w => w.id === selectedMealWindow)) {
+          setSelectedMealWindow(activeMealWindows[0]?.id || 'Meal 1');
+        }
+      }, [viewedDayIndex, activeMealWindows]);
+
+      // Pure Dynamic Categories (Derived exclusively from active Master DB rows)
+      const categories = useMemo(() => {
+        const dbCats = masterDb.map(i => (i.category || '').trim()).filter(Boolean);
+        const uniqueCats = Array.from(new Set(dbCats)).sort((a, b) => a.localeCompare(b));
+        return ['All', ...uniqueCats];
+      }, [masterDb]);
+
+      const updateCurrentDay = (updaterFn) => {
+        setDaysArchive(prev => {
+          const base = prev[viewedDayIndex] || {
+            dayIndex: viewedDayIndex,
+            label: calInfo.defaultLabel,
+            items: [],
+            mealWindows: DEFAULT_MEAL_WINDOWS,
+            manualKcal: null, manualProtein: null, manualCarbs: null, manualFat: null,
+            bodyMetrics: {},
+            anchors: { waterMl: 0, zeroSodaCans: 0, b12Taken: false, d3Taken: false },
+            tdeeBase: protocolRules.tdeeBaseline || 2450,
+            kineticBurnKcal: 0
+          };
+          return { ...prev, [viewedDayIndex]: updaterFn(base) };
+        });
+      };
+
+      const weightTelemetry = useMemo(() => {
+        let latestAny = null;
+        let latestWed = null;
+        for (let d = viewedDayIndex; d >= minDayIndex; d--) {
+          const src = d === viewedDayIndex ? currentDayObj : daysArchive[d];
+          const w = parseFloat(src?.bodyMetrics?.weightKg);
+          if (w && w > 0) {
+            if (!latestAny) latestAny = { weight: w, day: d };
+            if (!latestWed && getCalendarInfoForDay(d).isWednesday) {
+              latestWed = { weight: w, day: d };
+            }
+          }
+        }
+        const activeRef = latestAny?.weight || latestWed?.weight || protocolRules.defaultRefWeightKg || 74.7;
+        return { activeRef, latestAny, latestWed };
+      }, [daysArchive, viewedDayIndex, currentDayObj, minDayIndex, protocolRules]);
+
+      const dailyTotals = useMemo(() => {
+        const m = getDayMetrics(currentDayObj);
+        const proteinPerKg = Number((m.protein / weightTelemetry.activeRef).toFixed(2));
+        return {
+          ...m,
+          deltaCeiling: Number((m.kcal - protocolRules.nominalCeiling).toFixed(1)),
+          netDeficitTdee: Number((m.kcal - currentDayTdee).toFixed(1)),
+          proteinDelta: Number((m.protein - protocolRules.proteinFloor).toFixed(1)),
+          proteinCompliance: Number(((m.protein / protocolRules.proteinFloor) * 100).toFixed(1)),
+          proteinPerKg,
+          remainingKcalRunway: Number((protocolRules.nominalCeiling - m.kcal).toFixed(1)),
+          remainingProteinToFloor: Number(Math.max(0, protocolRules.proteinFloor - m.protein).toFixed(1)),
+          remainingCarbsTo190: Number((protocolRules.carbBandMax - m.carbs).toFixed(1)),
+          remainingCarbsTo200: Number((protocolRules.carbCeiling - m.carbs).toFixed(1)),
+          remainingFatTo55: Number((protocolRules.fatBandMax - m.fat).toFixed(1))
+        };
+      }, [currentDayObj, protocolRules, currentDayTdee, weightTelemetry]);
+
+      const rolling48Hr = useMemo(() => {
+        const prevIdx = viewedDayIndex - 1;
+        const prevDay = daysArchive[prevIdx];
+        const prevMetrics = prevDay ? getDayMetrics(prevDay) : { kcal: 0, protein: 0, carbs: 0, fat: 0 };
+        const hasPrev = Boolean(prevDay);
+        const divisor = hasPrev ? 2 : 1;
+
+        const sum48Kcal = Number((prevMetrics.kcal + dailyTotals.kcal).toFixed(1));
+        const avg48Kcal = Number((sum48Kcal / divisor).toFixed(1));
+        const sum48Prot = Number((prevMetrics.protein + dailyTotals.protein).toFixed(1));
+        const avg48Prot = Number((sum48Prot / divisor).toFixed(1));
+        const maxTodayFor1600Float = hasPrev
+          ? Number((protocolRules.nominalCeiling * 2 - prevMetrics.kcal).toFixed(1))
+          : protocolRules.nominalCeiling;
+
+        return { prevIdx, prevKcal: prevMetrics.kcal, sum48Kcal, avg48Kcal, sum48Prot, avg48Prot, maxTodayFor1600Float };
+      }, [daysArchive, viewedDayIndex, dailyTotals, protocolRules]);
+
+      const trailingMetrics = useMemo(() => {
+        const windowDays = [];
+        for (let d = viewedDayIndex - 6; d <= viewedDayIndex; d++) {
+          const daySource = d === viewedDayIndex ? currentDayObj : daysArchive[d];
+          if (daySource) {
+            const m = getDayMetrics(daySource);
+            const dTdee = getDayTdee(daySource, protocolRules.tdeeBaseline);
+            const deltaCeiling = Number((m.kcal - protocolRules.nominalCeiling).toFixed(1));
+            const preservedDeficit = Number((m.kcal - dTdee).toFixed(1));
+            const pDelta = Number((m.protein - protocolRules.proteinFloor).toFixed(1));
+            const pPct = Number(((m.protein / protocolRules.proteinFloor) * 100).toFixed(1));
+            const status = pDelta >= 0 ? `Cleared (+${pDelta.toFixed(1)}g)` : pPct >= 90 ? `${pPct}% (Triage)` : `Deficit (${pDelta.toFixed(1)}g)`;
+            const wKg = parseFloat(daySource.bodyMetrics?.weightKg) || null;
+            const cInfo = getCalendarInfoForDay(d);
+            windowDays.push({
+              dayIndex: d,
+              dateStr: cInfo.dateStr,
+              isWednesday: cInfo.isWednesday,
+              label: daySource.label,
+              kcal: m.kcal,
+              protein: m.protein,
+              carbs: m.carbs,
+              fat: m.fat,
+              tdee: dTdee,
+              weightKg: wKg,
+              deltaCeiling,
+              preservedDeficit,
+              pDelta,
+              pPct,
+              status,
+              isCurrent: d === viewedDayIndex
+            });
+          }
+        }
+
+        const count = windowDays.length || 1;
+        const sumKcal = Number(windowDays.reduce((acc, d) => acc + d.kcal, 0).toFixed(1));
+        const avgKcal = Number((sumKcal / count).toFixed(2));
+        const sumDeficit = Number(windowDays.reduce((acc, d) => acc + d.preservedDeficit, 0).toFixed(1));
+        const avgWeeklyDeficit = Number((sumDeficit / count).toFixed(2));
+
+        const sumProtein = Number(windowDays.reduce((acc, d) => acc + d.protein, 0).toFixed(1));
+        const avgProtein = Number((sumProtein / count).toFixed(2));
+        const weeklyProteinCompliance = Number(((avgProtein / protocolRules.proteinFloor) * 100).toFixed(1));
+
+        const sumCarbs = Number(windowDays.reduce((acc, d) => acc + d.carbs, 0).toFixed(1));
+        const avgCarbs = Number((sumCarbs / count).toFixed(2));
+
+        const sumFat = Number(windowDays.reduce((acc, d) => acc + d.fat, 0).toFixed(1));
+        const avgFat = Number((sumFat / count).toFixed(2));
+
+        const weighedDays = windowDays.filter(d => d.weightKg !== null && d.weightKg > 0);
+        const avgWeight7d = weighedDays.length > 0
+          ? Number((weighedDays.reduce((acc, d) => acc + d.weightKg, 0) / weighedDays.length).toFixed(2))
+          : null;
+
+        let priorCumulative = protocolRules.baseCumulativeDay97;
+        for (let d = 98; d < viewedDayIndex; d++) {
+          if (daysArchive[d]) priorCumulative += getDayMetrics(daysArchive[d]).kcal;
+        }
+        priorCumulative = Number(priorCumulative.toFixed(1));
+        const lifetimeTotalKcal = Number((priorCumulative + dailyTotals.kcal).toFixed(1));
+        const lifetimeDailyAvg = Number((lifetimeTotalKcal / viewedDayIndex).toFixed(2));
+
+        return {
+          sevenDayArray: windowDays,
+          sumKcal, avgKcal, avgWeeklyDeficit,
+          sumProtein, avgProtein, weeklyProteinCompliance,
+          sumCarbs, avgCarbs,
+          sumFat, avgFat,
+          avgWeight7d, weighedCount: weighedDays.length,
+          priorCumulative, lifetimeTotalKcal, lifetimeDailyAvg
+        };
+      }, [daysArchive, viewedDayIndex, currentDayObj, dailyTotals, protocolRules]);
+
+      // Extrapolator Calculations
+      const extrapolatedDbPreview = useMemo(() => {
+        const isUnitMode = customEntry.targetStorageMode === 'unit';
+        const refQty = isUnitMode ? 1.0 : (parseFloat(customEntry.sourceRefQty) || 100.0);
+        const rawP = parseFloat(customEntry.protein) || 0;
+        const rawC = parseFloat(customEntry.carbs) || 0;
+        const rawF = parseFloat(customEntry.fat) || 0;
+        const atwaterKcal = Number(((rawP * 4) + (rawC * 4) + (rawF * 9)).toFixed(1));
+        const rawKcal = customEntry.kcal !== '' ? (parseFloat(customEntry.kcal) || 0) : atwaterKcal;
+
+        const targetBase = isUnitMode ? 1.0 : 100.0;
+        const scaleFactor = isUnitMode ? 1.0 : (100.0 / (refQty > 0 ? refQty : 100.0));
+
+        const normKcal = Number((rawKcal * scaleFactor).toFixed(1));
+        const normP = Number((rawP * scaleFactor).toFixed(1));
+        const normC = Number((rawC * scaleFactor).toFixed(1));
+        const normF = Number((rawF * scaleFactor).toFixed(1));
+
+        const nowQty = parseFloat(customEntry.consumedNowQty) || 0;
+        const nowRatio = nowQty / targetBase;
+        const nowKcal = Number((normKcal * nowRatio).toFixed(1));
+        const nowP = Number((normP * nowRatio).toFixed(1));
+        const nowC = Number((normC * nowRatio).toFixed(1));
+        const nowF = Number((normF * nowRatio).toFixed(1));
+
+        return {
+          refQty, atwaterKcal,
+          normKcal, normP, normC, normF,
+          nowQty, nowKcal, nowP, nowC, nowF,
+          targetBase, isUnitMode
+        };
+      }, [customEntry]);
+
+      // Natural Alphanumeric Row ID Comparison Helper
+      const compareRowIds = (idA, idB) => {
+        return (idA || 'ZZZ').trim().localeCompare((idB || 'ZZZ').trim(), undefined, { numeric: true, sensitivity: 'base' });
+      };
+
+      // Slices and splices new row into its proper sorted index in the array
+      const insertRowInOrder = (array, newRow) => {
+        const copy = [...array];
+        let insertIndex = copy.findIndex(item => compareRowIds(item.rowId, newRow.rowId) > 0);
+        if (insertIndex === -1) {
+          copy.push(newRow); // Largest or no higher match, push to end
+        } else {
+          copy.splice(insertIndex, 0, newRow);
+        }
+        return copy;
+      };
+
+      const handleApplyAtwaterToCustom = () => {
+        setCustomEntry(prev => ({ ...prev, kcal: String(extrapolatedDbPreview.atwaterKcal) }));
+      };
+
+      const handleSaveCustomToMasterDbOnly = () => {
+        if (!customEntry.name.trim()) { alert('Enter a food name first.'); return; }
+        const baseUnitLabel = customEntry.targetStorageMode === 'unit' ? '1 pc / unit' : customEntry.targetStorageMode;
+
+        const newDbRow = {
+          id: `db-${Date.now()}`,
+          rowId: customEntry.rowId || `Custom`,
+          category: customEntry.category || 'Custom Additions',
+          name: customEntry.name.trim(),
+          baseUnit: baseUnitLabel,
+          mode: customEntry.targetStorageMode,
+          baseQty: extrapolatedDbPreview.targetBase,
+          unitMassG: extrapolatedDbPreview.targetBase,
+          kcal: extrapolatedDbPreview.normKcal,
+          protein: extrapolatedDbPreview.normP,
+          carbs: extrapolatedDbPreview.normC,
+          fat: extrapolatedDbPreview.normF,
+          source: `${customEntry.source || 'SF-400 scale verified'} ${customEntry.targetStorageMode !== 'unit' ? `(Extrapolated from ${extrapolatedDbPreview.refQty}${customEntry.targetStorageMode === '100ml' ? 'ml' : 'g'})` : ''}`
+        };
+
+        setMasterDb(prev => insertRowInOrder(prev, newDbRow));
+        setSelectedDbItem(newDbRow);
+        setCustomEntry({
+          name: '', rowId: 'Custom', category: customEntry.category,
+          targetStorageMode: '100g', sourceRefQty: '100.0', consumedNowQty: '100.0',
+          kcal: '', protein: '', carbs: '', fat: '', source: 'SF-400 scale verified'
+        });
+        setShowCustomAdder(false);
+      };
+
+      const handleLogCustomNow = (alsoSaveToDb = false) => {
+        if (!customEntry.name.trim()) { alert('Enter a food name first.'); return; }
+        const suffix = customEntry.targetStorageMode === 'unit' ? ' pc(s)' : (customEntry.targetStorageMode === '100ml' ? 'ml' : 'g');
+        const newItem = {
+          id: `custom-${Date.now()}`,
+          mealWindow: selectedMealWindow,
+          name: customEntry.name.trim(),
+          refUnit: `${extrapolatedDbPreview.nowQty.toFixed(1)}${suffix}`,
+          massG: customEntry.targetStorageMode === 'unit' ? null : extrapolatedDbPreview.nowQty,
+          kcal: extrapolatedDbPreview.nowKcal,
+          protein: extrapolatedDbPreview.nowP,
+          carbs: extrapolatedDbPreview.nowC,
+          fat: extrapolatedDbPreview.nowF,
+          source: customEntry.source || 'SF-400 scale verified'
+        };
+
+        updateCurrentDay(base => ({ ...base, items: [...(base.items || []), newItem] }));
+        if (alsoSaveToDb) {
+          handleSaveCustomToMasterDbOnly();
+        } else {
+          setCustomEntry({
+            name: '', rowId: 'Custom', category: customEntry.category,
+            targetStorageMode: '100g', sourceRefQty: '100.0', consumedNowQty: '100.0',
+            kcal: '', protein: '', carbs: '', fat: '', source: 'SF-400 scale verified'
+          });
+          setShowCustomAdder(false);
+        }
+      };
+
+// Pipe Delimited Shorthand Parser (|) — Multi-Line Batch Enabled
+      const handleParseAndLogPipe = (actionType = 'log_only') => {
+        if (!pipeInputText.trim()) return;
+
+        // Split text into individual lines
+        const lines = pipeInputText
+          .split(/\r?\n/)
+          .map(line => line.trim())
+          .filter(line => line.length > 0 && !line.startsWith('//') && !line.startsWith('#'));
+
+        if (lines.length === 0) return;
+
+        const newLogItems = [];
+        const newDbRows = [];
+        const now = Date.now();
+
+        lines.forEach((line, idx) => {
+          const parts = line.split('|').map(s => s.trim());
+          if (parts.length < 3) return; // Skip invalid lines
+
+          const name = parts[0];
+          const qtyStr = parts[1];
+          const kcal = parseFloat(parts[2]) || 0;
+          const p = parts[3] ? (parseFloat(parts[3]) || 0) : 0;
+          const c = parts[4] ? (parseFloat(parts[4]) || 0) : 0;
+          const f = parts[5] ? (parseFloat(parts[5]) || 0) : 0;
+
+          const massMatch = qtyStr.match(/([\d\.]+)\s*(g|ml)/i);
+          const parsedMass = massMatch ? parseFloat(massMatch[1]) : 0;
+
+          if (actionType === 'log_only' || actionType === 'log_and_db') {
+            const currentTargetWindow = activeMealWindows.some(w => w.id === selectedMealWindow)
+              ? selectedMealWindow
+              : (activeMealWindows[0]?.id || 'Meal 1');
+            newLogItems.push({
+              id: `pipe-${now}-${idx}`,
+              mealWindow: currentTargetWindow,
+              name,
+              refUnit: qtyStr,
+              massG: parsedMass > 0 ? parsedMass : null,
+              kcal,
+              protein: p,
+              carbs: c,
+              fat: f,
+              source: 'Pipe shorthand entry'
+            });
+          }
+
+          if (actionType === 'db_only' || actionType === 'log_and_db') {
+            const isGrams = qtyStr.toLowerCase().includes('g') && parsedMass > 0;
+            const ratio = isGrams ? (100.0 / parsedMass) : 1.0;
+            newDbRows.push({
+              id: `db-pipe-${now}-${idx}`,
+              rowId: 'Custom',
+              category: 'Custom Additions',
+              name,
+              baseUnit: isGrams ? '100g' : qtyStr,
+              mode: isGrams ? '100g' : 'unit',
+              baseQty: isGrams ? 100.0 : 1.0,
+              unitMassG: isGrams ? 100.0 : null,
+              kcal: Number((kcal * ratio).toFixed(1)),
+              protein: Number((p * ratio).toFixed(1)),
+              carbs: Number((c * ratio).toFixed(1)),
+              fat: Number((f * ratio).toFixed(1)),
+              source: `Shorthand intake (${qtyStr})`
+            });
+          }
+        });
+
+        // Commit all parsed log items together in one batch
+        if (newLogItems.length > 0) {
+          updateCurrentDay(base => ({
+            ...base,
+            items: [...(base.items || []), ...newLogItems]
+          }));
+        }
+
+        // Commit all new DB rows together
+        if (newDbRows.length > 0) {
+          setMasterDb(prev => {
+            let updated = [...prev];
+            newDbRows.forEach(row => {
+              updated = insertRowInOrder(updated, row);
+            });
+            return updated;
+          });
+        }
+
+        setPipeInputText('');
+        setShowPipeDrawer(false);
+      };
+      // Inline DB Editor
+      const handleStartEditRow = (row) => { setEditingRowId(row.id); setEditDraft({ ...row }); };
+      const handleSaveEditRow = () => {
+        if (!editingRowId) return;
+        const updatedRow = {
+          ...editDraft,
+          kcal: Number(parseFloat(editDraft.kcal || 0).toFixed(1)),
+          protein: Number(parseFloat(editDraft.protein || 0).toFixed(1)),
+          carbs: Number(parseFloat(editDraft.carbs || 0).toFixed(1)),
+          fat: Number(parseFloat(editDraft.fat || 0).toFixed(1)),
+          unitMassG: editDraft.unitMassG ? Number(parseFloat(editDraft.unitMassG).toFixed(2)) : null
+        };
+        setMasterDb(prev => prev.map(r => r.id === editingRowId ? updatedRow : r));
+        if (selectedDbItem?.id === editingRowId) setSelectedDbItem(updatedRow);
+        setEditingRowId(null);
+      };
+
+      const handleCalc449InEditDraft = () => {
+        const p = parseFloat(editDraft.protein) || 0;
+        const c = parseFloat(editDraft.carbs) || 0;
+        const f = parseFloat(editDraft.fat) || 0;
+        const kcal449 = Number(((p * 4) + (c * 4) + (f * 9)).toFixed(1));
+        setEditDraft(prev => ({ ...prev, kcal: kcal449 }));
+      };
+
+      // Scale Logger
+      const handleSelectDbItem = (item) => {
+        setSelectedDbItem(item);
+        if (item.mode === 'unit') {
+          setInputMode('units');
+          setInputValue('1');
+        } else {
+          setInputMode('mass');
+          setInputValue('100.0');
+        }
+        setPieceNote('');
+      };
+
+      const scaledPreview = useMemo(() => {
+        if (!selectedDbItem) return { ratio: 0, kcal: 0, protein: 0, carbs: 0, fat: 0, refLabel: '', effectiveMassG: 0 };
+        const val = parseFloat(inputValue) || 0;
+        let ratio = 0;
+        let refLabel = '';
+        let effectiveMassG = val;
+
+        if (selectedDbItem.mode === 'unit') {
+          if (inputMode === 'units') {
+            ratio = val / 1.0;
+            effectiveMassG = selectedDbItem.unitMassG ? Number((val * selectedDbItem.unitMassG).toFixed(1)) : val;
+            refLabel = pieceNote ? `${val} pc(s) (${pieceNote})` : `${val} × ${selectedDbItem.baseUnit}`;
+          } else {
+            const unitG = selectedDbItem.unitMassG || 100.0;
+            ratio = val / unitG;
+            effectiveMassG = val;
+            refLabel = pieceNote ? `${pieceNote} pcs (${val.toFixed(1)}g net mass)` : `${val.toFixed(1)}g net mass`;
+          }
+        } else {
+          ratio = val / 100.0;
+          effectiveMassG = val;
+          const unitSuffix = selectedDbItem.mode === '100ml' ? 'ml' : 'g';
+          refLabel = pieceNote ? `${pieceNote} (${val.toFixed(1)}${unitSuffix})` : `${val.toFixed(1)}${unitSuffix}`;
+        }
+
+        return {
+          ratio, effectiveMassG,
+          kcal: Number((selectedDbItem.kcal * ratio).toFixed(1)),
+          protein: Number((selectedDbItem.protein * ratio).toFixed(1)),
+          carbs: Number((selectedDbItem.carbs * ratio).toFixed(1)),
+          fat: Number((selectedDbItem.fat * ratio).toFixed(1)),
+          refLabel
+        };
+      }, [selectedDbItem, inputMode, inputValue, pieceNote]);
+
+      const handleAddFromScale = () => {
+        if (!selectedDbItem) return;
+        const isByUnit = selectedDbItem.mode === 'unit' && inputMode === 'units';
+        const parsedVal = parseFloat(inputValue) || 1;
+        const newItem = {
+          id: `log-${Date.now()}`,
+          mealWindow: selectedMealWindow,
+          name: selectedDbItem.name,
+          units: isByUnit ? parsedVal : undefined,
+          isUnit: isByUnit,
+          refUnit: scaledPreview.refLabel,
+          massG: isByUnit ? (selectedDbItem.unitMassG ? Number((parsedVal * selectedDbItem.unitMassG).toFixed(1)) : null) : scaledPreview.effectiveMassG,
+          kcal: scaledPreview.kcal,
+          protein: scaledPreview.protein,
+          carbs: scaledPreview.carbs,
+          fat: scaledPreview.fat,
+          source: `SF-400 scale verified (${selectedDbItem.rowId})`
+        };
+        updateCurrentDay(base => ({ ...base, items: [...(base.items || []), newItem] }));
+        setSelectedDbItem(null);
+        setSearchQuery('');
+      };
+
+     const handleInlineRescaleItem = (itemId, rawInput) => {
+        updateCurrentDay(base => ({
+          ...base,
+          items: (base.items || []).map(item => {
+            if (item.id !== itemId) return item;
+
+            // Allow the field to be temporarily empty so the leading digit can be deleted
+            if (rawInput === '' || rawInput === null) {
+              return { ...item, _rawPortionInput: '', kcal: 0, protein: 0, carbs: 0, fat: 0 };
+            }
+
+            const val = parseFloat(rawInput);
+            if (isNaN(val) || val < 0) return item;
+
+            const cleanItemName = (item.name || '').trim().toLowerCase();
+            const dbMatch = masterDb.find(db => (db.name || '').trim().toLowerCase() === cleanItemName);
+            const isUnitItem = dbMatch ? dbMatch.mode === 'unit' : (item.massG === null || item.isUnit);
+
+            if (isUnitItem) {
+              const baseKcal = dbMatch ? dbMatch.kcal : (item.kcal / (item.units || 1));
+              const baseP = dbMatch ? dbMatch.protein : (item.protein / (item.units || 1));
+              const baseC = dbMatch ? dbMatch.carbs : (item.carbs / (item.units || 1));
+              const baseF = dbMatch ? dbMatch.fat : (item.fat / (item.units || 1));
+              const unitWeight = dbMatch?.unitMassG || item.unitMassG || null;
+
+              return {
+                ...item,
+                units: val,
+                massG: unitWeight ? Number((val * unitWeight).toFixed(1)) : null,
+                _rawPortionInput: rawInput,
+                refUnit: `${val} pc(s)${unitWeight ? ` (~${(val * unitWeight).toFixed(0)}g)` : ''}`,
+                kcal: Number((baseKcal * val).toFixed(1)),
+                protein: Number((baseP * val).toFixed(1)),
+                carbs: Number((baseC * val).toFixed(1)),
+                fat: Number((baseF * val).toFixed(1))
+              };
+            }
+
+            // Standard mass-based items (grams / ml)
+            const baseG = dbMatch?.baseQty || 100.0;
+            const refKcal = dbMatch ? dbMatch.kcal : ((item.kcal / (item.massG || 100)) * 100);
+            const refP = dbMatch ? dbMatch.protein : ((item.protein / (item.massG || 100)) * 100);
+            const refC = dbMatch ? dbMatch.carbs : ((item.carbs / (item.massG || 100)) * 100);
+            const refF = dbMatch ? dbMatch.fat : ((item.fat / (item.massG || 100)) * 100);
+            const ratio = val / baseG;
+
+            return {
+              ...item,
+              massG: val,
+              _rawPortionInput: rawInput,
+              refUnit: `${val.toFixed(1)}g`,
+              kcal: Number((refKcal * ratio).toFixed(1)),
+              protein: Number((refP * ratio).toFixed(1)),
+              carbs: Number((refC * ratio).toFixed(1)),
+              fat: Number((refF * ratio).toFixed(1))
+            };
+          })
+        }));
+      };
+
+// Reorder meal window up or down (strictly scoped to viewedDayIndex)
+      const handleMoveMealWindow = (windowId, direction) => {
+        updateCurrentDay(base => {
+          const windows = [...(base.mealWindows || DEFAULT_MEAL_WINDOWS)];
+          const idx = windows.findIndex(w => w.id === windowId);
+          if (idx === -1) return base;
+          const targetIdx = direction === 'up' ? idx - 1 : idx + 1;
+          if (targetIdx < 0 || targetIdx >= windows.length) return base;
+          
+          const temp = windows[idx];
+          windows[idx] = windows[targetIdx];
+          windows[targetIdx] = temp;
+          return { ...base, mealWindows: windows };
+        });
+      };
+
+      // Inline rename meal window descriptor (e.g., "Meal 4 (Lunch)" -> "Meal 4 (Brunch / Graze)")
+      const handleRenameMealWindow = (windowId, currentLabel) => {
+        const newLabel = prompt(`Rename meal window:`, currentLabel);
+        if (!newLabel || !newLabel.trim()) return;
+        updateCurrentDay(base => ({
+          ...base,
+          mealWindows: (base.mealWindows || DEFAULT_MEAL_WINDOWS).map(w => 
+            w.id === windowId ? { ...w, label: newLabel.trim() } : w
+          )
+        }));
+      };
+
+      // Remove meal window from viewedDayIndex (strictly protected)
+      const handleDeleteMealWindow = (windowId, windowLabel) => {
+        const linkedItems = (currentDayObj.items || []).filter(i => i.mealWindow === windowId);
+        if (linkedItems.length > 0) {
+          alert(`Cannot remove "${windowLabel}" because it currently contains ${linkedItems.length} logged item(s). Delete or move those items first.`);
+          return;
+        }
+        if (!confirm(`Remove empty window "${windowLabel}" from Day ${viewedDayIndex}?`)) return;
+        updateCurrentDay(base => {
+          const remainingWindows = (base.mealWindows || DEFAULT_MEAL_WINDOWS).filter(w => w.id !== windowId);
+          return {
+            ...base,
+            mealWindows: remainingWindows
+          };
+        });
+        // Safely fallback selectedMealWindow to first available window
+        const fallback = activeMealWindows.find(w => w.id !== windowId)?.id || 'Meal 1';
+        setSelectedMealWindow(fallback);
+      };
+      const handleSaveWindowAsPreset = (windowId, windowLabel) => {
+        const windowItems = (currentDayObj.items || []).filter(i => i.mealWindow === windowId);
+        if (windowItems.length === 0) return;
+        const presetName = prompt(`Name this Curated Meal Preset (from ${windowLabel}):`, `My ${windowId} Stack`);
+        if (!presetName || !presetName.trim()) return;
+        const cleanName = presetName.trim();
+        const newPreset = {
+          id: `preset-${Date.now()}`,
+          name: cleanName,
+          items: windowItems.map(i => ({
+            name: i.name, refUnit: i.refUnit, massG: i.massG,
+            kcal: i.kcal, protein: i.protein, carbs: i.carbs, fat: i.fat, source: i.source
+          }))
+        };
+        setMealPresets(prev => [newPreset, ...prev]);
+
+        const totalKcal = Number(windowItems.reduce((s, i) => s + Number(i.kcal || 0), 0).toFixed(1));
+        const totalP = Number(windowItems.reduce((s, i) => s + Number(i.protein || 0), 0).toFixed(1));
+        const totalC = Number(windowItems.reduce((s, i) => s + Number(i.carbs || 0), 0).toFixed(1));
+        const totalF = Number(windowItems.reduce((s, i) => s + Number(i.fat || 0), 0).toFixed(1));
+        const totalMass = Number(windowItems.reduce((s, i) => s + Number(i.massG || 0), 0).toFixed(1));
+
+        if (confirm(`Saved "${cleanName}" to 1-Click Meal Presets!\n\nAlso add "${cleanName}" (${totalKcal} kcal | ${totalP}g P) as a single row in Master Reference DB?`)) {
+          const newDbRow = {
+            id: `db-preset-${Date.now()}`,
+            rowId: `Preset`,
+            category: 'Curated Meals',
+            name: cleanName,
+            baseUnit: `1 serving (${totalMass}g total)`,
+            mode: 'unit',
+            baseQty: 1.0,
+            unitMassG: totalMass > 0 ? totalMass : 100.0,
+            kcal: totalKcal, protein: totalP, carbs: totalC, fat: totalF,
+            source: `Curated Composite (${windowItems.map(x => x.name).join(' + ')})`
+          };
+          setMasterDb(prev => [newDbRow, ...prev]);
+        }
+      };
+
+      const handleUnpackPresetToWindow = (preset) => {
+        const unpackedItems = preset.items.map((item, idx) => ({
+          ...item,
+          id: `unpacked-${Date.now()}-${idx}`,
+          mealWindow: selectedMealWindow
+        }));
+        updateCurrentDay(base => ({ ...base, items: [...(base.items || []), ...unpackedItems] }));
+      };
+
+      const handleDeleteMasterDbRow = (rowObj) => {
+        if (!confirm(`Delete "[${rowObj.rowId}] ${rowObj.name}" from Master Reference DB?`)) return;
+        setMasterDb(prev => prev.filter(r => r.id !== rowObj.id));
+      };
+
+      // Backup & Restore
+      const handleExportBackupJson = () => {
+        const cleanedArchive = pruneEmptyFutureDays(daysArchive, 105);
+        const cleanKeys = Object.keys(cleanedArchive).map(Number).sort((a, b) => a - b);
+        const latestCleanDay = cleanKeys[cleanKeys.length - 1] || 105;
+
+        const backup = {
+          version: 5,
+          daysArchive: cleanedArchive,
+          viewedDayIndex: Math.min(viewedDayIndex, latestCleanDay),
+          masterDb,
+          mealPresets,
+          protocolRules
+        };
+        const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `sf400-protocol-backup-day-${latestCleanDay}.json`;
+        a.click();
+      };
+
+      const handleRestoreJsonFile = (e) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          try {
+            const parsed = JSON.parse(event.target.result);
+            if (parsed.daysArchive) {
+              const cleaned = pruneEmptyFutureDays(parsed.daysArchive, 105);
+              const cleanKeys = Object.keys(cleaned).map(Number).sort((a, b) => a - b);
+              const maxClean = cleanKeys[cleanKeys.length - 1] || 105;
+              setDaysArchive(cleaned);
+              setViewedDayIndex(Math.min(parsed.viewedDayIndex || maxClean, maxClean));
+              if (parsed.masterDb && parsed.masterDb.length > 0) setMasterDb(parsed.masterDb);
+              if (parsed.mealPresets) setMealPresets(parsed.mealPresets);
+              if (parsed.protocolRules) setProtocolRules(prev => ({ ...prev, ...parsed.protocolRules }));
+              alert(`Restored clean archive (Days ${cleanKeys[0]}–${maxClean}) successfully!`);
+            }
+          } catch (err) {
+            alert('Invalid JSON backup file.');
+          }
+        };
+        reader.readAsText(file);
+        e.target.value = '';
+      };
+
+      // Markdown Generator
+      const protocolMarkdownReport = useMemo(() => {
+        const dIdx = viewedDayIndex;
+        const priorIdx = dIdx - 1;
+        const startWindowIdx = trailingMetrics.sevenDayArray[0]?.dayIndex || dIdx - 6;
+
+        const mealRows = activeMealWindows.map((mw) => {
+          const items = (currentDayObj.items || []).filter((i) => i.mealWindow === mw.id);
+          if (items.length === 0) return null;
+          return items.map((item, idx) =>
+            `| ${idx === 0 ? `**${mw.label}**` : ''} | ${item.name} | ${item.refUnit} | ${item.kcal.toFixed(1)} | ${item.protein.toFixed(1)} | ${item.carbs.toFixed(1)} | ${item.fat.toFixed(1)} | ${item.source} |`
+          ).join('\n');
+        }).filter(Boolean).join('\n');
+
+        const kcalExpr = trailingMetrics.sevenDayArray.map((d) => d.kcal.toFixed(1)).join(' + ');
+        const protExpr = trailingMetrics.sevenDayArray.map((d) => d.protein.toFixed(1)).join(' + ');
+        const carbExpr = trailingMetrics.sevenDayArray.map((d) => d.carbs.toFixed(1)).join(' + ');
+        const fatExpr = trailingMetrics.sevenDayArray.map((d) => d.fat.toFixed(1)).join(' + ');
+
+        const trailingRows = trailingMetrics.sevenDayArray.map((d) =>
+          `| **Day ${d.dayIndex}** | ${d.label} | ${d.kcal.toLocaleString('en-US', { minimumFractionDigits: 1 })} | ${d.deltaCeiling >= 0 ? `+${d.deltaCeiling.toFixed(1)}` : d.deltaCeiling.toFixed(1)} | ${d.preservedDeficit.toLocaleString('en-US', { minimumFractionDigits: 1 })} | ${d.protein.toFixed(1)} | ${d.status} |`
+        ).join('\n');
+
+        const carbStatus = dailyTotals.carbs < protocolRules.carbBandMin
+          ? `Below 160–190g band (${dailyTotals.carbs.toFixed(1)}g)`
+          : dailyTotals.carbs <= protocolRules.carbBandMax
+          ? `Optimal 160–190g target band (${dailyTotals.carbs.toFixed(1)}g)`
+          : dailyTotals.carbs <= protocolRules.carbCeiling
+          ? `Buffer zone <200g ceiling (${dailyTotals.carbs.toFixed(1)}g)`
+          : `Above 200g ceiling (+${(dailyTotals.carbs - protocolRules.carbCeiling).toFixed(1)}g)`;
+
+        const fatStatus = dailyTotals.fat < protocolRules.fatBandMin
+          ? `High-Deficit Win (<40g functional threshold: ${dailyTotals.fat.toFixed(1)}g)`
+          : dailyTotals.fat <= protocolRules.fatBandMax
+          ? `Desirable 40–55g functional band (${dailyTotals.fat.toFixed(1)}g)`
+          : `Above 55g functional band (+${(dailyTotals.fat - protocolRules.fatBandMax).toFixed(1)}g)`;
+
+        const extraLines = [];
+        if (currentBody.weightKg) {
+          extraLines.push(`- **Morning Scale Weight:** ${currentBody.weightKg} kg (${calInfo.isWednesday ? 'Official Wednesday Weekly Anchor' : `7-Day Rolling Avg: ${trailingMetrics.avgWeight7d || currentBody.weightKg} kg`})`);
+        }
+        if (currentAnchors.waterMl > 0 || currentAnchors.zeroSodaCans > 0 || currentAnchors.b12Taken || currentAnchors.d3Taken) {
+          const aParts = [];
+          if (currentAnchors.waterMl > 0) aParts.push(`Water: ${(currentAnchors.waterMl / 1000).toFixed(2)}L (${currentAnchors.waterMl} ml)`);
+          if (currentAnchors.zeroSodaCans > 0) aParts.push(`Zero-Cal Soda: ${currentAnchors.zeroSodaCans} unit(s)`);
+          if (protocolRules.enableB12Tracker && currentAnchors.b12Taken) aParts.push(`Oral B12: ✓`);
+          if (protocolRules.enableD3Tracker && currentAnchors.d3Taken) aParts.push(`Weekly Vit D3: ✓`);
+          extraLines.push(`- **Hydration & Micro Anchors:** ${aParts.join(' | ')}`);
+        }
+
+        return `### 1. Final Itemized Food Log: Day ${dIdx} (${currentDayObj.label})
+| Meal / Window | Item & Description | Reference Unit / Scale Mass | Calories (kcal) | Protein (g) | Carbs (g) | Fat (g) | Metrology & Database Source |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+${mealRows || '| *No itemized meals logged* | — | — | 0.0 | 0.0 | 0.0 | 0.0 | — |'}
+| **Day ${dIdx} Total** | **—** | **—** | **${dailyTotals.kcal.toLocaleString('en-US', { minimumFractionDigits: 1 })}** | **${dailyTotals.protein.toFixed(1)}** | **${dailyTotals.carbs.toFixed(1)}** | **${dailyTotals.fat.toFixed(1)}** | **All Meals Locked** |
+
+### 2. Daily Summary & Performance Metrics
+- **Total Daily Energy Intake:** ${dailyTotals.kcal.toLocaleString('en-US', { minimumFractionDigits: 1 })} kcal
+- **Caloric Delta vs. ${protocolRules.nominalCeiling.toFixed(1)} kcal Ceiling:** ${dailyTotals.deltaCeiling >= 0 ? `+${dailyTotals.deltaCeiling.toFixed(1)}` : dailyTotals.deltaCeiling.toFixed(1)} kcal ${dailyTotals.deltaCeiling > 0 ? 'above nominal deficit ceiling (absorbed under Somatic Triage)' : 'below nominal deficit ceiling'}
+- **Net Metabolic Deficit vs. ${currentDayTdee.toFixed(1)} kcal Active TDEE:** ${dailyTotals.netDeficitTdee.toFixed(1)} kcal preserved net deficit
+- **Rolling 48-Hour Float (Days ${rolling48Hr.prevIdx}–${dIdx}):** ${rolling48Hr.avg48Kcal.toFixed(1)} kcal/day average | ${rolling48Hr.sum48Prot.toFixed(1)}g cumulative 48h protein
+- **Protein Performance vs. ${protocolRules.proteinFloor.toFixed(1)}g Floor:** ${dailyTotals.protein.toFixed(1)}g (${dailyTotals.proteinDelta >= 0 ? `+${dailyTotals.proteinDelta.toFixed(1)}g above floor` : `${dailyTotals.proteinDelta.toFixed(1)}g below floor`}, achieving ${dailyTotals.proteinCompliance.toFixed(1)}% compliance | **${dailyTotals.proteinPerKg} g/kg**)
+- **Carbohydrates Consumed:** ${dailyTotals.carbs.toFixed(1)}g — *${carbStatus}*
+- **Fat Consumed:** ${dailyTotals.fat.toFixed(1)}g — *${fatStatus}*${extraLines.length > 0 ? '\n' + extraLines.join('\n') : ''}
+
+### 3. Trailing 7-Day Calorie & Protein Array (Days ${startWindowIdx}–${dIdx})
+| Day Index | Calendar Date / Day Type | Total Energy (kcal) | Delta vs. ${protocolRules.nominalCeiling.toFixed(0)} kcal | Preserved Deficit vs. TDEE | Total Protein (g) | Protein Floor Status |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+${trailingRows}
+
+### 4. Explicit Trailing 7-Day Rolling Averages Calculation
+- **Trailing 7-Day Caloric Sum:**
+  $$${kcalExpr} = ${trailingMetrics.sumKcal.toLocaleString('en-US', { minimumFractionDigits: 1 })}\\text{ kcal}$$
+- **Trailing 7-Day Rolling Calorie Average:**
+  $$\\frac{${trailingMetrics.sumKcal.toLocaleString('en-US', { minimumFractionDigits: 1 })}\\text{ kcal}}{${trailingMetrics.sevenDayArray.length || 7}} = \\mathbf{${trailingMetrics.avgKcal.toLocaleString('en-US', { minimumFractionDigits: 2 })}\\text{ kcal/day}}$$
+- **Trailing 7-Day Protein Sum:**
+  $$${protExpr} = ${trailingMetrics.sumProtein.toFixed(1)}\\text{g}$$
+- **Trailing 7-Day Rolling Protein Average:**
+  $$\\frac{${trailingMetrics.sumProtein.toFixed(1)}\\text{g}}{${trailingMetrics.sevenDayArray.length || 7}} = \\mathbf{${trailingMetrics.avgProtein.toFixed(2)}\\text{g/day}}$$
+- **Trailing 7-Day Carbohydrates Sum:**
+  $$${carbExpr} = ${trailingMetrics.sumCarbs.toFixed(1)}\\text{g}$$
+- **Trailing 7-Day Rolling Carbohydrates Average:**
+  $$\\frac{${trailingMetrics.sumCarbs.toFixed(1)}\\text{g}}{${trailingMetrics.sevenDayArray.length || 7}} = \\mathbf{${trailingMetrics.avgCarbs.toFixed(2)}\\text{g/day}}$$
+- **Trailing 7-Day Fat Sum:**
+  $$${fatExpr} = ${trailingMetrics.sumFat.toFixed(1)}\\text{g}$$
+- **Trailing 7-Day Rolling Fat Average:**
+  $$\\frac{${trailingMetrics.sumFat.toFixed(1)}\\text{g}}{${trailingMetrics.sevenDayArray.length || 7}} = \\mathbf{${trailingMetrics.avgFat.toFixed(2)}\\text{g/day}}$$
+
+### 5. Cumulative Lifetime Metrics (Days 1–${dIdx})
+- **Prior Cumulative Intake (Days 1–${priorIdx}):** ${trailingMetrics.priorCumulative.toLocaleString('en-US', { minimumFractionDigits: 1 })} kcal
+- **Day ${dIdx} Addition:** ${dailyTotals.kcal.toLocaleString('en-US', { minimumFractionDigits: 1 })} kcal
+- **Cumulative Lifetime Energy Intake:** ${trailingMetrics.lifetimeTotalKcal.toLocaleString('en-US', { minimumFractionDigits: 1 })} kcal
+- **Cumulative Lifetime Daily Average:**
+  $$\\frac{${trailingMetrics.lifetimeTotalKcal.toLocaleString('en-US', { minimumFractionDigits: 1 })}\\text{ kcal}}{${dIdx}\\text{ days}} = \\mathbf{${trailingMetrics.lifetimeDailyAvg.toLocaleString('en-US', { minimumFractionDigits: 2 })}\\text{ kcal/day}}$$`;
+      }, [viewedDayIndex, currentDayObj, activeMealWindows, dailyTotals, trailingMetrics, rolling48Hr, protocolRules, currentDayTdee, currentBody, currentAnchors, calInfo]);
+
+      const filteredDb = useMemo(() => {
+        return masterDb.filter(item => {
+          const matchesCat = categoryFilter === 'All' || item.category === categoryFilter;
+          const q = searchQuery.trim().toLowerCase();
+          const matchesSearch = !q || item.name.toLowerCase().includes(q) || (item.rowId || '').toLowerCase().includes(q);
+          return matchesCat && matchesSearch;
+        });
+      }, [masterDb, categoryFilter, searchQuery]);
+
+      const handleSort = (key) => {
+        setSortConfig(prev => ({
+          key,
+          direction: prev.key === key && prev.direction === 'asc' ? 'desc' : 'asc'
+        }));
+      };
+
+      const filteredMasterDbView = useMemo(() => {
+        const list = masterDb.filter(item => {
+          const matchesCat = masterDbCatFilter === 'All' || item.category === masterDbCatFilter;
+          const q = masterDbSearch.trim().toLowerCase();
+          const matchesSearch = !q || 
+            (item.name || '').toLowerCase().includes(q) || 
+            (item.rowId || '').toLowerCase().includes(q) ||
+            (item.source || '').toLowerCase().includes(q);
+          return matchesCat && matchesSearch;
+        });
+
+        return list.sort((a, b) => {
+          const { key, direction } = sortConfig;
+          let valA = a[key] ?? '';
+          let valB = b[key] ?? '';
+
+          // Numerical comparison for macros & calories
+          if (['kcal', 'protein', 'carbs', 'fat'].includes(key)) {
+            valA = parseFloat(valA) || 0;
+            valB = parseFloat(valB) || 0;
+            return direction === 'asc' ? valA - valB : valB - valA;
+          }
+
+          // Natural alphanumeric comparison for Row ID, Names, Categories, Units
+          valA = String(valA).trim();
+          valB = String(valB).trim();
+          const res = valA.localeCompare(valB, undefined, { numeric: true, sensitivity: 'base' });
+          return direction === 'asc' ? res : -res;
+        });
+      }, [masterDb, masterDbCatFilter, masterDbSearch, sortConfig]);
+
+      return (
+        <div className="min-h-screen bg-slate-950 text-slate-100 pb-16">
+          <input ref={fileInputRef} type="file" accept=".json,application/json" onChange={handleRestoreJsonFile} className="hidden" />
+
+         {/* ================================================================
+              1. STICKY HEADER: LOCKED 2-ROW RESPONSIVE DOCK
+          ================================================================ */}
+          <header className="sticky top-0 z-30 border-b border-slate-800 bg-slate-950/95 backdrop-blur px-3 py-2">
+            <div className="max-w-7xl mx-auto space-y-2">
+              
+              {/* ROW 1: MAXIMIZED LABEL BAR + COMPACT NAV & SETTINGS */}
+              <div className="flex items-center gap-1.5">
+                
+                {/* Left: Previous Day Button */}
+                <button
+                  type="button"
+                  onClick={() => viewedDayIndex > minDayIndex && setViewedDayIndex(viewedDayIndex - 1)}
+                  disabled={viewedDayIndex <= minDayIndex}
+                  className={`px-2 sm:px-2.5 py-1 rounded text-xs font-mono font-bold border shrink-0 transition ${
+                    viewedDayIndex <= minDayIndex
+                      ? 'bg-slate-900/40 text-slate-600 border-slate-800/50 cursor-not-allowed'
+                      : 'bg-slate-900 hover:bg-slate-800 text-emerald-400 border-slate-700 cursor-pointer'
+                  }`}
+                  title={`Go to Day ${viewedDayIndex - 1}`}
+                >
+                  ◀ <span className="hidden sm:inline">D{viewedDayIndex - 1}</span>
+                </button>
+
+                {/* Center: Maximized Title / Date Input */}
+                <input
+                  type="text"
+                  value={currentDayObj.label}
+                  onChange={(e) => updateCurrentDay(base => ({ ...base, label: e.target.value }))}
+                  className="flex-1 min-w-0 bg-slate-900 border border-slate-700 focus:border-emerald-500 rounded px-2.5 py-1 text-xs sm:text-sm font-bold text-white focus:outline-none"
+                  placeholder="Date & Day Label"
+                />
+
+                {/* Right: Next Day Button */}
+                <button
+                  type="button"
+                  onClick={() => setViewedDayIndex(viewedDayIndex + 1)}
+                  className="px-2 sm:px-2.5 py-1 rounded text-xs font-mono font-bold bg-slate-900 hover:bg-slate-800 text-sky-300 border border-slate-700 transition cursor-pointer shrink-0"
+                  title={`Go to Day ${viewedDayIndex + 1}`}
+                >
+                  <span className="hidden sm:inline">D{viewedDayIndex + 1}</span> ▶
+                </button>
+
+                {/* Consolidated Settings & Actions Dropdown (⚙) */}
+                <div className="relative shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setShowHeaderMenu(!showHeaderMenu)}
+                    className="px-2.5 py-1 rounded bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-700 text-xs font-bold cursor-pointer"
+                    title="Menu & Day Actions"
+                  >
+                    ⚙
+                  </button>
+                  {showHeaderMenu && (
+                    <div className="absolute right-0 mt-1 w-52 bg-slate-900 border border-slate-700 rounded-lg shadow-2xl p-2 space-y-2 z-50 text-xs animate-in fade-in zoom-in-95 duration-150">
+                      
+                      {/* Tag Day Selector */}
+                      <div>
+                        <label className="block text-[10px] font-mono text-slate-400 uppercase mb-1">🏷 Day Protocol Tag</label>
+                        <select
+                          value=""
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            if (!val) return;
+                            updateCurrentDay(base => {
+                              const datePrefix = (base.label && base.label.includes('—'))
+                                ? base.label.split('—')[0].trim()
+                                : calInfo.dateStr;
+                              return { ...base, label: `${datePrefix} — ${val}` };
+                            });
+                            setShowHeaderMenu(false);
+                          }}
+                          className="w-full bg-slate-950 border border-slate-700 text-slate-200 text-xs rounded px-2 py-1 focus:border-emerald-500 focus:outline-none cursor-pointer"
+                        >
+                          <option value="" disabled>Select Tag ▾</option>
+                          {DAY_TYPE_TAGS.map(tag => (
+                            <option key={tag} value={tag}>{tag}</option>
+                          ))}
+                        </select>
+                      </div>
+
+                      {/* Quick Markdown Copy */}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          navigator.clipboard.writeText(protocolMarkdownReport);
+                          setCopiedReport(true);
+                          setTimeout(() => {
+                            setCopiedReport(false);
+                            setShowHeaderMenu(false);
+                          }, 1000);
+                        }}
+                        className="w-full text-left px-2 py-1.5 rounded bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/30 font-medium text-[11px] cursor-pointer flex items-center justify-between"
+                      >
+                        <span>{copiedReport ? '✓ Copied to Clipboard' : '📋 Copy Day Report'}</span>
+                        <span className="font-mono text-[10px]">MD</span>
+                      </button>
+
+                      {/* Google Drive Live Sync Dock */}
+                      <div className="border-t border-slate-800 pt-1.5 space-y-1">
+                        <div className="flex items-center justify-between px-1 text-[11px]">
+                          <span className="text-slate-400">Drive Cloud Sync:</span>
+                          <span className="font-mono text-emerald-400 text-[10px] font-bold">{driveSyncStatus}</span>
+                        </div>
+                        {!driveAccessToken ? (
+                          <button
+                            type="button"
+                            onClick={handleConnectDrive}
+                            className="w-full text-left px-2 py-1 rounded bg-sky-600/20 hover:bg-sky-600/30 text-sky-300 font-mono text-[11px] cursor-pointer"
+                          >
+                            ☁ Connect Google Drive
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => pullFromDrive()}
+                            className="w-full text-left px-2 py-1 rounded hover:bg-slate-800 text-sky-300 font-mono text-[11px] cursor-pointer flex items-center justify-between"
+                          >
+                            <span>🔄 Sync Now</span>
+                            <span className="text-[10px] text-slate-500 font-sans">Force Pull</span>
+                          </button>
+                        )}
+                      </div>
+
+                      {/* Backup & Restore */}
+                      <div className="border-t border-slate-800 pt-1.5 space-y-1">
+                        <button
+                          type="button"
+                          onClick={() => { handleExportBackupJson(); setShowHeaderMenu(false); }}
+                          className="w-full text-left px-2 py-1 rounded hover:bg-slate-800 text-slate-300 font-mono text-[11px] cursor-pointer"
+                        >
+                          ⬇ Backup JSON Archive
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => { fileInputRef.current?.click(); setShowHeaderMenu(false); }}
+                          className="w-full text-left px-2 py-1 rounded hover:bg-slate-800 text-amber-300 font-mono text-[11px] cursor-pointer"
+                        >
+                          ⬆ Restore JSON Archive
+                        </button>
+                      </div>
+
+                      {/* Visibility Toggles */}
+                      <div className="border-t border-slate-800 pt-1.5 space-y-1">
+                        <label className="flex items-center gap-2 px-1 text-[11px] text-slate-300 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={protocolRules.enableB12Tracker}
+                            onChange={(e) => setProtocolRules(p => ({ ...p, enableB12Tracker: e.target.checked }))}
+                          />
+                          <span>Show B12 Tracker</span>
+                        </label>
+                        <label className="flex items-center gap-2 px-1 text-[11px] text-slate-300 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={protocolRules.enableD3Tracker}
+                            onChange={(e) => setProtocolRules(p => ({ ...p, enableD3Tracker: e.target.checked }))}
+                          />
+                          <span>Show Vit D3 Tracker</span>
+                        </label>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* ROW 2: HORIZONTALLY SCROLLABLE ANCHORS + STATUS TRAY */}
+              <div className="flex items-center justify-between gap-2 overflow-x-auto whitespace-nowrap pt-1 border-t border-slate-800/80 text-xs scrollbar-none">
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <span className="text-[10px] font-mono uppercase text-slate-400">Anchors:</span>
+                  
+                  {/* Water Tracker */}
+                  <div className="inline-flex items-center rounded bg-sky-500/15 border border-sky-500/30">
+                    <button
+                      type="button"
+                      onClick={() => updateCurrentDay(b => ({ ...b, anchors: { ...currentAnchors, waterMl: (currentAnchors.waterMl || 0) + 250 } }))}
+                      className="px-2 py-0.5 text-sky-300 font-mono text-[11px] hover:bg-sky-500/20 cursor-pointer"
+                    >
+                      💧 +250ml ({((currentAnchors.waterMl || 0) / 1000).toFixed(2)}L)
+                    </button>
+                    {currentAnchors.waterMl > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => updateCurrentDay(b => ({ ...b, anchors: { ...currentAnchors, waterMl: Math.max(0, (currentAnchors.waterMl || 0) - 250) } }))}
+                        className="px-1 text-[10px] font-mono text-slate-400 hover:text-white border-l border-sky-500/30 cursor-pointer"
+                        title="Subtract 250ml"
+                      >
+                        -
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Soda Tracker */}
+                  <div className="inline-flex items-center rounded bg-slate-900 border border-slate-700">
+                    <button
+                      type="button"
+                      onClick={() => updateCurrentDay(b => ({ ...b, anchors: { ...currentAnchors, zeroSodaCans: Math.max(0, (currentAnchors.zeroSodaCans || 0) - 1) } }))}
+                      className="px-1.5 py-0.5 text-[10px] font-mono text-slate-400 hover:text-rose-300 border-r border-slate-700 cursor-pointer"
+                      title="Subtract 1 can"
+                    >
+                      -1
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => updateCurrentDay(b => ({ ...b, anchors: { ...currentAnchors, zeroSodaCans: (currentAnchors.zeroSodaCans || 0) + 1 } }))}
+                      className="px-2 py-0.5 font-mono text-[11px] text-slate-200 cursor-pointer hover:bg-slate-800"
+                    >
+                      🥤 +1 Soda ({currentAnchors.zeroSodaCans || 0})
+                    </button>
+                  </div>
+
+                  {/* B12 Tracker */}
+                  {protocolRules.enableB12Tracker && (
+                    <button
+                      type="button"
+                      onClick={() => updateCurrentDay(b => ({ ...b, anchors: { ...currentAnchors, b12Taken: !currentAnchors.b12Taken } }))}
+                      className={`px-2 py-0.5 rounded font-mono text-[11px] border cursor-pointer ${
+                        currentAnchors.b12Taken
+                          ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40 font-bold'
+                          : 'bg-slate-900 text-slate-400 border-slate-800 hover:border-slate-700'
+                      }`}
+                    >
+                      {currentAnchors.b12Taken ? '✓ B12' : '○ B12'}
+                    </button>
+                  )}
+
+                  {/* D3 Tracker — strictly visible on Wednesdays */}
+                  {protocolRules.enableD3Tracker && calInfo.isWednesday && (
+                    <button
+                      type="button"
+                      onClick={() => updateCurrentDay(b => ({ ...b, anchors: { ...currentAnchors, d3Taken: !currentAnchors.d3Taken } }))}
+                      className={`px-2 py-0.5 rounded font-mono text-[11px] border cursor-pointer ${
+                        currentAnchors.d3Taken
+                          ? 'bg-amber-500/25 text-amber-200 border-amber-500/50 font-bold'
+                          : 'bg-amber-500/15 text-amber-300 border-amber-500/40 animate-pulse font-bold'
+                      }`}
+                      title="Weekly Wednesday Vitamin D3 Anchor"
+                    >
+                      {currentAnchors.d3Taken ? '✓ Vit D3' : '★ Take D3'}
+                    </button>
+                  )}
+                </div>
+
+                {/* Right: Date Checkpoint + Live Save Status */}
+                <div className="flex items-center gap-1.5 shrink-0 font-mono text-[10px]">
+                  {calInfo.isWednesday && (
+                    <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 font-bold">
+                      ★ Wed Anchor
+                    </span>
+                  )}
+                  {isVirtualUnsavedDay ? (
+                    <span className="text-amber-300 bg-amber-950/60 border border-amber-500/30 px-1.5 py-0.5 rounded">
+                      Unsaved
+                    </span>
+                  ) : (
+                    <span className="text-emerald-400 bg-emerald-950/60 border border-emerald-500/20 px-1.5 py-0.5 rounded">
+                      {lastSavedText}
+                    </span>
+                  )}
+                </div>
+
+              </div>
+            </div>
+          </header>
+
+          <main className="max-w-7xl mx-auto px-4 pt-4 space-y-4">
+            
+            {/* MAIN NAVIGATION TABS */}
+            <div className="flex gap-2 border-b border-slate-800 pb-3 overflow-x-auto">
+              {[
+                { id: 'dashboard', label: '1. Dashboard (Monitor)' },
+                { id: 'studio', label: '2. Entry Studio (Log)' },
+                { id: 'trailing', label: '3. Trailing 7-Day History' },
+                { id: 'database', label: `4. Master DB (${masterDb.length})` },
+                { id: 'export', label: '5. Markdown Output' }
+              ].map((t) => (
+                <button
+                  key={t.id}
+                  onClick={() => setActiveTab(t.id)}
+                  className={`px-4 py-2 rounded-lg text-xs font-bold whitespace-nowrap cursor-pointer transition ${
+                    activeTab === t.id ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 shadow-lg' : 'text-slate-400 bg-slate-900/60 border border-transparent hover:bg-slate-800'
+                  }`}
+                >
+                  {t.label}
+                </button>
+              ))}
+            </div>
+
+            {/* TAB 1: DASHBOARD ONLY METRICS */}
+            {activeTab === 'dashboard' && (
+              <div className="space-y-4 animate-in fade-in duration-300">
+                {/* 2. SIX TELEMETRY CARDS */}
+                <section className="grid grid-cols-2 lg:grid-cols-6 gap-3">
+              {/* Daily Energy */}
+              <div className="bg-slate-900 border border-slate-800 rounded-xl p-3.5">
+                <div className="text-[11px] text-slate-400 uppercase">Day {viewedDayIndex} Energy</div>
+                <div className="text-xl font-bold font-mono text-white mt-1">
+                  {dailyTotals.kcal.toFixed(1)} <span className="text-xs font-normal text-slate-400">kcal</span>
+                </div>
+                <div className={`text-xs font-mono mt-1 ${dailyTotals.deltaCeiling <= 0 ? 'text-emerald-400' : 'text-amber-400'}`}>
+                  {dailyTotals.deltaCeiling >= 0 ? `+${dailyTotals.deltaCeiling.toFixed(1)}` : dailyTotals.deltaCeiling.toFixed(1)} vs 1600
+                </div>
+              </div>
+
+              {/* 48-Hour Float */}
+              <div className="bg-slate-900 border border-indigo-500/30 rounded-xl p-3.5">
+                <div className="flex items-center justify-between text-[11px] text-indigo-300 uppercase font-semibold">
+                  <span>48-Hr Float</span>
+                  <span className="font-mono text-[10px]">D{rolling48Hr.prevIdx}+D{viewedDayIndex}</span>
+                </div>
+                <div className="text-xl font-bold font-mono text-indigo-200 mt-1">
+                  {rolling48Hr.avg48Kcal.toFixed(1)} <span className="text-xs font-normal text-slate-400">kcal/d</span>
+                </div>
+                <div className="text-[11px] font-mono text-slate-400 mt-1">
+                  48h Prot: <strong className="text-sky-300">{rolling48Hr.sum48Prot.toFixed(1)}g</strong> ({rolling48Hr.avg48Prot}g/d)
+                </div>
+              </div>
+
+              {/* Net Deficit */}
+              <div className="bg-slate-900 border border-slate-800 rounded-xl p-3.5 flex flex-col justify-between">
+                <div className="flex items-center justify-between text-[11px] text-slate-400 uppercase">
+                  <span>Net Deficit</span>
+                  <span className="font-mono text-emerald-400">{currentDayTdee} TDEE</span>
+                </div>
+                <div className="text-xl font-bold font-mono text-emerald-400 mt-0.5">
+                  {dailyTotals.netDeficitTdee.toFixed(1)} <span className="text-xs font-normal text-slate-400">kcal</span>
+                </div>
+                <div className="flex flex-wrap items-center gap-1.5 mt-1">
+                  <select
+                    value={currentDayObj.tdeeBase || 2450}
+                    onChange={(e) => updateCurrentDay(b => ({ ...b, tdeeBase: Number(e.target.value) }))}
+                    className="bg-slate-950 border border-slate-800 rounded px-1.5 py-0.5 text-[10px] text-slate-300 flex-1 min-w-0 truncate"
+                  >
+                    {TDEE_MODES.map(m => <option key={m.id} value={m.kcal}>{m.label}</option>)}
+                  </select>
+                  <input
+                    type="number"
+                    step="25"
+                    placeholder="+Burn"
+                    value={currentDayObj.kineticBurnKcal || ''}
+                    onChange={(e) => updateCurrentDay(b => ({ ...b, kineticBurnKcal: Number(e.target.value || 0) }))}
+                    className="w-16 shrink-0 bg-slate-950 border border-slate-800 rounded px-1.5 py-0.5 text-[10px] font-mono text-emerald-300 focus:border-emerald-500 focus:outline-none"
+                    title="Optional extra road/walk calorie burn"
+                  />
+                </div>
+              </div>
+
+              {/* Protein Summary */}
+              <div className="bg-slate-900 border border-slate-800 rounded-xl p-3.5">
+                <div className="flex items-center justify-between text-[11px] text-slate-400 uppercase">
+                  <span>Protein (70g+)</span>
+                  <span className="font-mono text-sky-400">{dailyTotals.proteinPerKg} g/kg</span>
+                </div>
+                <div className="text-xl font-bold font-mono text-sky-300 mt-1">
+                  {dailyTotals.protein.toFixed(1)}g <span className="text-xs">({dailyTotals.proteinCompliance}%)</span>
+                </div>
+                <div className="text-[11px] font-mono text-slate-400 mt-1">
+                  C: <span className="text-emerald-300">{dailyTotals.carbs.toFixed(1)}g</span> | F: <span className="text-rose-300">{dailyTotals.fat.toFixed(1)}g</span>
+                </div>
+              </div>
+
+              {/* 7-Day Rolling Avg */}
+              <div className="bg-slate-900 border border-slate-800 rounded-xl p-3 sm:p-3.5 flex flex-col justify-between">
+                <div className="flex items-center justify-between text-[10px] sm:text-[11px] text-slate-400 uppercase font-semibold">
+                  <span>7d Rolling Avg</span>
+                  <span className="font-mono text-[9px] text-slate-500">Life: {trailingMetrics.lifetimeDailyAvg.toFixed(0)}</span>
+                </div>
+                <div className="text-lg sm:text-xl font-bold font-mono text-violet-300 mt-0.5">
+                  {trailingMetrics.avgKcal.toFixed(1)} <span className="text-xs font-normal text-slate-400">kcal/d</span>
+                </div>
+                <div className="text-[10px] font-mono text-slate-400 mt-1 flex items-center justify-between gap-1 flex-wrap">
+                  <span>P <strong className="text-sky-300">{trailingMetrics.avgProtein.toFixed(1)}</strong></span>
+                  <span className="text-slate-600">·</span>
+                  <span>C <strong className="text-emerald-300">{trailingMetrics.avgCarbs.toFixed(1)}</strong></span>
+                  <span className="text-slate-600">·</span>
+                  <span>F <strong className="text-rose-300">{trailingMetrics.avgFat.toFixed(1)}</strong></span>
+                </div>
+              </div>
+
+              {/* Weight Card */}
+              <div className={`bg-slate-900 border rounded-xl p-3.5 flex flex-col justify-between ${calInfo.isWednesday ? 'border-amber-500/50' : 'border-emerald-500/30'}`}>
+                <div className="flex items-center justify-between text-[11px] text-emerald-300 uppercase font-semibold">
+                  <span>{calInfo.isWednesday ? '★ Wed Anchor Wt' : 'Scale Wt (Daily)'}</span>
+                  <button
+                    type="button"
+                    onClick={() => setShowTapeDrawer(!showTapeDrawer)}
+                    className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800 text-sky-300 hover:bg-slate-700 cursor-pointer"
+                  >
+                    {showTapeDrawer ? '▲ Tape' : '📐 +Tape'}
+                  </button>
+                </div>
+                <div className="flex items-center gap-1.5 mt-1">
+                  <input
+                    type="number"
+                    step="0.1"
+                    placeholder={String(weightTelemetry.activeRef)}
+                    value={currentBody.weightKg || ''}
+                    onChange={(e) => updateCurrentDay(b => ({ ...b, bodyMetrics: { ...(b.bodyMetrics || {}), weightKg: e.target.value } }))}
+                    className="w-20 bg-slate-950 border border-slate-700 rounded px-2 py-1 text-sm font-mono font-bold text-white focus:border-emerald-500 focus:outline-none"
+                  />
+                  <span className="text-xs text-slate-400 font-mono">kg</span>
+                </div>
+                <div className="text-[10px] text-slate-400 mt-1 font-mono flex justify-between">
+                  <span>7d Avg: <strong className="text-emerald-300">{trailingMetrics.avgWeight7d ? `${trailingMetrics.avgWeight7d}kg` : '—'}</strong></span>
+                  {weightTelemetry.latestWed && (
+                    <span>Wed: {weightTelemetry.latestWed.weight}kg</span>
+                  )}
+                </div>
+              </div>
+            </section>
+
+            {/* 3. RUNWAY BARS */}
+            <section className="bg-slate-900/90 border border-slate-800 rounded-xl p-3.5 space-y-3">
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-3 text-xs">
+                {/* Calorie Runway */}
+                <div className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5">
+                  <div className="flex justify-between font-mono text-[11px]">
+                    <span className="text-slate-400">CALORIE RUNWAY (1,600)</span>
+                    <span className={dailyTotals.remainingKcalRunway >= 0 ? 'text-emerald-400 font-bold' : 'text-amber-400 font-bold'}>
+                      {dailyTotals.remainingKcalRunway >= 0 ? `${dailyTotals.remainingKcalRunway.toFixed(1)} kcal left` : `${Math.abs(dailyTotals.remainingKcalRunway).toFixed(1)} kcal over`}
+                    </span>
+                  </div>
+                  <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden mt-1.5">
+                    <div
+                      className={`h-full ${dailyTotals.kcal <= 1600 ? 'bg-emerald-500' : 'bg-amber-500'}`}
+                      style={{ width: `${Math.min(100, (dailyTotals.kcal / 1600) * 100)}%` }}
+                    />
+                  </div>
+                </div>
+
+                {/* Protein Floor */}
+                <div className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5">
+                  <div className="flex justify-between font-mono text-[11px]">
+                    <span className="text-slate-400">PROTEIN FLOOR (70g+)</span>
+                    <span className={dailyTotals.protein >= 70 ? 'text-sky-300 font-bold' : 'text-amber-300 font-bold'}>
+                      {dailyTotals.protein >= 70 ? `✓ Cleared (+${dailyTotals.proteinDelta.toFixed(1)}g)` : `${dailyTotals.remainingProteinToFloor.toFixed(1)}g to go`}
+                    </span>
+                  </div>
+                  <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden mt-1.5">
+                    <div
+                      className="h-full bg-sky-400"
+                      style={{ width: `${Math.min(100, (dailyTotals.protein / 70) * 100)}%` }}
+                    />
+                  </div>
+                </div>
+
+                {/* Carb Band */}
+                <div className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5">
+                  <div className="flex justify-between font-mono text-[11px]">
+                    <span className="text-slate-400">CARB BAND (160–190g | &lt;200g)</span>
+                    <span className={
+                      dailyTotals.carbs <= 190 ? 'text-emerald-300 font-bold' : dailyTotals.carbs <= 200 ? 'text-amber-300 font-bold' : 'text-rose-400 font-bold'
+                    }>
+                      {dailyTotals.carbs.toFixed(1)}g ({dailyTotals.remainingCarbsTo200 >= 0 ? `${dailyTotals.remainingCarbsTo200.toFixed(1)}g to 200` : `+${Math.abs(dailyTotals.remainingCarbsTo200).toFixed(1)}g >200`})
+                    </span>
+                  </div>
+                  <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden mt-1.5">
+                    <div
+                      className={`h-full ${dailyTotals.carbs <= 190 ? 'bg-emerald-400' : dailyTotals.carbs <= 200 ? 'bg-amber-400' : 'bg-rose-500'}`}
+                      style={{ width: `${Math.min(100, (dailyTotals.carbs / 200) * 100)}%` }}
+                    />
+                  </div>
+                </div>
+
+                {/* Fat Band */}
+                <div className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5">
+                  <div className="flex justify-between font-mono text-[11px]">
+                    <span className="text-slate-400">FAT (&lt;40g Win | 40–55g Func)</span>
+                    <span className={
+                      dailyTotals.fat < 40 ? 'text-emerald-400 font-bold' : dailyTotals.fat <= 55 ? 'text-sky-300 font-bold' : 'text-rose-400 font-bold'
+                    }>
+                      {dailyTotals.fat < 40
+                        ? `${dailyTotals.fat.toFixed(1)}g (★ Lean Win)`
+                        : dailyTotals.fat <= 55
+                        ? `${dailyTotals.fat.toFixed(1)}g (Functional)`
+                        : `${dailyTotals.fat.toFixed(1)}g (+${(dailyTotals.fat - 55).toFixed(1)}g)`}
+                    </span>
+                  </div>
+                  <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden mt-1.5">
+                    <div
+                      className={`h-full ${dailyTotals.fat < 40 ? 'bg-emerald-400' : dailyTotals.fat <= 55 ? 'bg-sky-400' : 'bg-rose-500'}`}
+                      style={{ width: `${Math.min(100, (dailyTotals.fat / 55) * 100)}%` }}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* Balanced Evening Plate Drawer */}
+              {dailyTotals.remainingKcalRunway > 0 && (
+                <div className="mt-4 bg-slate-900 border border-slate-800 rounded-xl px-4 py-1.5">
+                  <details className="text-xs text-slate-300">
+                    <summary className="cursor-pointer font-semibold text-emerald-400 select-none">
+                      🍽 Suggest Balanced Evening Plate ({dailyTotals.remainingKcalRunway.toFixed(0)} kcal remaining)
+                    </summary>
+                    <div className="mt-2.5 mb-1 pl-2 border-l-2 border-emerald-500/50 space-y-1 text-slate-300 font-mono text-[11px]">
+                      <div>• <strong>2 Dry Rotis (~77g)</strong>: ~200 kcal | 5.2g P | 39g C</div>
+                      <div>• <strong>150g Cooked Dal</strong>: ~120 kcal | 8.0g P | 18g C</div>
+                      <div>• <strong>100g Amul Masti Dahi</strong>: ~65 kcal | 4.0g P | 4.6g C</div>
+                      <div>• <strong>35g Dry Soya Chunks</strong>: ~121 kcal | 18.2g P | 11.5g C</div>
+                      <div className="pt-1 text-emerald-300 font-sans font-bold">
+                        ➔ Total Plate: ~506 kcal | ~35.4g Protein | Clean Fuel Bridge
+                      </div>
+                    </div>
+                  </details>
+                </div>
+              )}
+            </section>
+
+            {/* Body Tape Drawer */}
+            {showTapeDrawer && (
+              <section className="bg-slate-900/90 border border-sky-500/30 rounded-xl p-4 space-y-3">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-sky-300">
+                    Optional Body Recomposition Tape Metrics (Day {viewedDayIndex})
+                  </h3>
+                  <button onClick={() => setShowTapeDrawer(false)} className="text-xs text-slate-400 hover:text-white cursor-pointer">✕ Close</button>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+                  {[
+                    { key: 'waistCm', label: 'Waist / Navel (cm)', ph: '81.5' },
+                    { key: 'chestCm', label: 'Chest (cm)', ph: '98.0' },
+                    { key: 'bicepCm', label: 'Bicep Flexed (cm)', ph: '35.5' },
+                    { key: 'shouldersCm', label: 'Shoulders (cm)', ph: '114.0' },
+                    { key: 'thighCm', label: 'Thigh (cm)', ph: '54.0' }
+                  ].map(m => (
+                    <div key={m.key}>
+                      <label className="block text-[11px] text-slate-400 mb-1">{m.label}</label>
+                      <input
+                        type="number" step="0.1" placeholder={m.ph}
+                        value={currentBody[m.key] || ''}
+                        onChange={(e) => updateCurrentDay(b => ({ ...b, bodyMetrics: { ...(b.bodyMetrics || {}), [m.key]: e.target.value } }))}
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs font-mono text-white"
+                      />
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
+              </div>
+            )}
+
+            {/* SHARED WORKSPACE: TABLE (Dashboard) OR TOOLS+TABLE (Studio) */}
+            {(activeTab === 'dashboard' || activeTab === 'studio') && (
+              <div className={`grid grid-cols-1 gap-5 items-start ${activeTab === 'studio' ? 'lg:grid-cols-12' : ''}`}>
+                
+                {/* LEFT COLUMN: ENTRY TOOLS (Only renders on Studio Tab) */}
+                {activeTab === 'studio' && (
+                  <div className="lg:col-span-5 space-y-4 animate-in slide-in-from-left-4 duration-300">
+{/* MASTER MEAL WINDOW SELECTOR (Global for all 4 logging tools) */}
+                  <div className="bg-slate-900 border border-emerald-500/40 rounded-xl p-3 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] font-mono uppercase tracking-wider text-emerald-400 font-bold">
+                        Target Logging Window
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          // Find highest existing Meal number to avoid ID collisions
+                          const existingNums = activeMealWindows.map(w => {
+                            const match = w.id.match(/\d+/);
+                            return match ? parseInt(match[0], 10) : 0;
+                          });
+                          const nextNum = (existingNums.length > 0 ? Math.max(...existingNums) : 0) + 1;
+                          const sfx = prompt(`Label for Meal ${nextNum}:`, 'Street Refuel');
+                          if (sfx === null) return;
+                          const id = `Meal ${nextNum}`;
+                          const label = sfx.trim() ? `Meal ${nextNum} (${sfx.trim()})` : id;
+                          updateCurrentDay(b => ({ ...b, mealWindows: [...activeMealWindows, { id, label }] }));
+                          setTimeout(() => setSelectedMealWindow(id), 50);
+                        }}
+                        className="text-[10px] font-mono px-2 py-0.5 rounded bg-sky-500/15 text-sky-300 border border-sky-500/30 hover:bg-sky-500/25 cursor-pointer"
+                      >
+                        + New Window
+                      </button>
+                    </div>
+
+                    <div className="flex items-center gap-1.5">
+                      <select
+                        value={selectedMealWindow}
+                        onChange={(e) => setSelectedMealWindow(e.target.value)}
+                        className="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white font-medium focus:border-emerald-500 focus:outline-none truncate"
+                      >
+                        {activeMealWindows.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
+                      </select>
+                      
+                      <div className="flex items-center bg-slate-950 border border-slate-700 rounded-lg p-0.5 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const activeW = activeMealWindows.find(w => w.id === selectedMealWindow);
+                            if (activeW) handleRenameMealWindow(activeW.id, activeW.label);
+                          }}
+                          className="px-1.5 py-1 text-[11px] text-slate-300 hover:text-white hover:bg-slate-800 rounded cursor-pointer"
+                          title="Rename Selected Window"
+                        >
+                          ✎
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleMoveMealWindow(selectedMealWindow, 'up')}
+                          className="px-1.5 py-1 text-[11px] text-slate-300 hover:text-white hover:bg-slate-800 rounded cursor-pointer"
+                          title="Move Window Up"
+                        >
+                          ▲
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleMoveMealWindow(selectedMealWindow, 'down')}
+                          className="px-1.5 py-1 text-[11px] text-slate-300 hover:text-white hover:bg-slate-800 rounded cursor-pointer"
+                          title="Move Window Down"
+                        >
+                          ▼
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const activeW = activeMealWindows.find(w => w.id === selectedMealWindow);
+                            if (activeW) handleDeleteMealWindow(activeW.id, activeW.label);
+                          }}
+                          className="px-1.5 py-1 text-[11px] text-slate-400 hover:text-rose-400 hover:bg-slate-800 rounded cursor-pointer"
+                          title="Delete Window (Only if 0 items logged)"
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                  {/* Curated Presets (Collapsible) */}
+                  <div className="bg-slate-900 border border-amber-500/30 rounded-xl p-3.5 space-y-2.5">
+                    <button
+                      type="button"
+                      onClick={() => setShowPresets(!showPresets)}
+                      className="w-full flex items-center justify-between text-xs font-bold uppercase tracking-wider text-amber-300 hover:text-amber-200 cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2">
+                        <span>{showPresets ? '▼' : '▶'}</span>
+                        <span>★ 1-Click Curated Meal Presets ({mealPresets.length})</span>
+                      </span>
+                     <span className="text-[10px] font-mono text-slate-400">Target: {activeMealWindows.find(w => w.id === selectedMealWindow)?.label || selectedMealWindow}</span>
+                    </button>
+
+                    {showPresets && (
+                      <div className="pt-2 border-t border-slate-800 space-y-1.5 max-h-48 overflow-y-auto pr-1">
+                        {mealPresets.map((preset) => {
+                          const sumKcal = preset.items.reduce((s, i) => s + Number(i.kcal || 0), 0);
+                          const sumP = preset.items.reduce((s, i) => s + Number(i.protein || 0), 0);
+                          return (
+                            <div key={preset.id} className="flex items-center justify-between gap-2 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs">
+                              <div className="truncate">
+                                <div className="font-semibold text-amber-200 truncate">{preset.name}</div>
+                                <div className="text-[10px] font-mono text-slate-400">
+                                  {preset.items.length} items • {sumKcal.toFixed(1)} kcal • {sumP.toFixed(1)}g P
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() => handleUnpackPresetToWindow(preset)}
+                                  className="px-2.5 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 font-semibold text-[11px] cursor-pointer"
+                                >
+                                  + Unpack
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    if (confirm('Delete this preset?')) setMealPresets(p => p.filter(x => x.id !== preset.id));
+                                  }}
+                                  className="text-slate-500 hover:text-rose-400 px-1 cursor-pointer"
+                                >
+                                  ✕
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* SF-400 Scale Logger (Collapsible) */}
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-3.5 space-y-2.5">
+                    <button
+                      type="button"
+                      onClick={() => setShowScaleLogger(!showScaleLogger)}
+                      className="w-full flex items-center justify-between text-xs font-bold uppercase tracking-wider text-emerald-400 hover:text-emerald-300 cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2">
+                        <span>{showScaleLogger ? '▼' : '▶'}</span>
+                        <span>SF-400 Scale Logger ({masterDb.length} Rows)</span>
+                      </span>
+                      <span className="text-[10px] font-mono text-slate-400">Target: {selectedMealWindow}</span>
+                    </button>
+
+                    {showScaleLogger && (
+                      <div className="space-y-3 pt-2 border-t border-slate-800/80">
+
+                    <div className="flex gap-1.5 overflow-x-auto pb-1">
+                      {categories.map(cat => (
+                        <button
+                          key={cat}
+                          type="button"
+                          onClick={() => setCategoryFilter(cat)}
+                          className={`px-2.5 py-1 rounded-md text-[11px] whitespace-nowrap cursor-pointer ${
+                            categoryFilter === cat ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-semibold' : 'bg-slate-950 text-slate-400 border border-slate-800'
+                          }`}
+                        >
+                          {cat}
+                        </button>
+                      ))}
+                    </div>
+
+                    <input
+                      type="text"
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      placeholder="Search Row ID or food name..."
+                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white"
+                    />
+
+                    <div className="max-h-48 overflow-y-auto border border-slate-800 rounded-lg divide-y divide-slate-800/60 bg-slate-950">
+                      {filteredDb.map((item) => (
+                        <button
+                          key={item.id}
+                          type="button"
+                          onClick={() => handleSelectDbItem(item)}
+                          className={`w-full text-left px-3 py-2 text-xs flex justify-between items-center cursor-pointer ${
+                            selectedDbItem?.id === item.id ? 'bg-emerald-500/15 text-emerald-200' : 'text-slate-300 hover:bg-slate-900'
+                          }`}
+                        >
+                          <div className="truncate pr-2">
+                            <strong className="font-mono text-emerald-400">[{item.rowId}]</strong> {item.name}
+                          </div>
+                          <span className="font-mono text-[11px] text-amber-300/90 shrink-0">
+                            {item.kcal} kcal / {item.mode === 'unit' ? '1 unit' : item.baseUnit}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+
+                    {selectedDbItem && (
+                      <div className="bg-slate-950 border border-slate-800 rounded-lg p-3.5 space-y-3">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs font-bold text-emerald-300">{selectedDbItem.name}</span>
+                          <div className="flex items-center gap-3">
+                            <span className="text-[11px] font-mono text-slate-400">Base: {selectedDbItem.baseUnit}</span>
+                            <button onClick={() => setSelectedDbItem(null)} className="text-slate-500 hover:text-slate-300 cursor-pointer font-bold text-lg leading-none">&times;</button>
+                          </div>
+                        </div>
+
+                        {selectedDbItem.mode === 'unit' && selectedDbItem.unitMassG && (
+                          <div className="flex gap-2 text-[11px]">
+                            <button
+                              type="button"
+                              onClick={() => { setInputMode('units'); setInputValue('1'); }}
+                              className={`flex-1 py-1 rounded border cursor-pointer ${inputMode === 'units' ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300 font-semibold' : 'bg-slate-900 border-slate-800 text-slate-400'}`}
+                            >
+                              By Units (1 pc = {selectedDbItem.kcal} kcal)
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => { setInputMode('mass'); setInputValue(String(selectedDbItem.unitMassG)); }}
+                              className={`flex-1 py-1 rounded border cursor-pointer ${inputMode === 'mass' ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300 font-semibold' : 'bg-slate-900 border-slate-800 text-slate-400'}`}
+                            >
+                              By Grams (~{selectedDbItem.unitMassG}g/unit)
+                            </button>
+                          </div>
+                        )}
+
+                        <div className="grid grid-cols-2 gap-2.5">
+                          <div>
+                            <label className="block text-[10px] text-slate-400 mb-1">
+                              {selectedDbItem.mode === 'unit' && inputMode === 'units' ? 'Units / Pieces' : 'SF-400 Net Mass (g / ml)'}
+                            </label>
+                            <input
+                              type="number" step="0.1" value={inputValue}
+                              onChange={(e) => setInputValue(e.target.value)}
+                              className="w-full bg-slate-900 border border-slate-700 rounded px-2.5 py-1.5 text-sm font-mono text-white"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-[10px] text-slate-400 mb-1">Note / Context</label>
+                            <input
+                              type="text" placeholder="e.g. 3 pcs or cooked" value={pieceNote}
+                              onChange={(e) => setPieceNote(e.target.value)}
+                              className="w-full bg-slate-900 border border-slate-700 rounded px-2.5 py-1.5 text-xs font-mono text-white"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-4 gap-1.5 text-center font-mono text-xs">
+                          <div className="bg-slate-900 p-1.5 rounded border border-slate-800"><div className="text-[10px] text-slate-400">KCAL</div><div className="font-bold text-amber-300">{scaledPreview.kcal.toFixed(1)}</div></div>
+                          <div className="bg-slate-900 p-1.5 rounded border border-slate-800"><div className="text-[10px] text-slate-400">PROT</div><div className="font-bold text-sky-300">{scaledPreview.protein.toFixed(1)}g</div></div>
+                          <div className="bg-slate-900 p-1.5 rounded border border-slate-800"><div className="text-[10px] text-slate-400">CARB</div><div className="font-bold text-emerald-300">{scaledPreview.carbs.toFixed(1)}g</div></div>
+                          <div className="bg-slate-900 p-1.5 rounded border border-slate-800"><div className="text-[10px] text-slate-400">FAT</div><div className="font-bold text-rose-300">{scaledPreview.fat.toFixed(1)}g</div></div>
+                        </div>
+
+                        <div className="flex gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setSelectedDbItem(null)}
+                            className="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold cursor-pointer"
+                          >
+                            Cancel
+                          </button>
+                          <button
+                            type="button"
+                            onClick={handleAddFromScale}
+                            className="flex-1 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs cursor-pointer"
+                          >
+                            + Log to {activeMealWindows.find(w => w.id === selectedMealWindow)?.label || selectedMealWindow}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* PIPE-DELIMITED SHORTHAND TOOL */}
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-3.5 space-y-2.5">
+                    <button
+                      type="button"
+                      onClick={() => setShowPipeDrawer(!showPipeDrawer)}
+                      className="w-full flex items-center justify-between text-xs font-bold uppercase tracking-wider text-amber-300 hover:text-amber-200 cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2">
+                        <span>{showPipeDrawer ? '▼' : '▶'}</span>
+                        <span>⚡ Rapid Pipe-Parser (|)</span>
+                      </span>
+                      <span className="text-[10px] font-mono text-slate-500">Fast Entry</span>
+                    </button>
+
+                    {showPipeDrawer && (
+                      <div className="pt-2 border-t border-slate-800 space-y-2">
+                        <p className="text-[11px] text-slate-400 font-mono">
+                          Format: <code>Item | Qty | kcal | P | C | F</code>
+                        </p>
+                        <textarea
+                          rows="4"
+                          placeholder="Paste 1 or multiple lines:&#10;Boiled Egg | 2 pcs | 140 | 12 | 1 | 9.5&#10;Raw Paneer | 100g | 265 | 18.5 | 2.5 | 20.8"
+                          value={pipeInputText}
+                          onChange={(e) => setPipeInputText(e.target.value)}
+                          className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white font-mono resize-y"
+                        />
+                       <div className="grid grid-cols-3 gap-1.5 pt-1">
+                          <button
+                            type="button"
+                            onClick={() => handleParseAndLogPipe('log_only')}
+                            className="py-1.5 px-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-semibold border border-slate-700 cursor-pointer"
+                          >
+                            ⚡ Log Meal
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleParseAndLogPipe('db_only')}
+                            className="py-1.5 px-2 rounded-lg bg-sky-600/20 hover:bg-sky-600/30 text-sky-300 text-[11px] font-semibold border border-sky-500/40 cursor-pointer"
+                          >
+                            + Save DB Only
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleParseAndLogPipe('log_and_db')}
+                            className="py-1.5 px-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-semibold cursor-pointer"
+                          >
+                            ⚡ Log & Save DB
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* COLLAPSIBLE 4-4-9 EXTRAPOLATOR */}
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-3.5 space-y-2.5">
+                    <button
+                      type="button"
+                      onClick={() => setShowCustomAdder(!showCustomAdder)}
+                      className="w-full flex items-center justify-between text-xs font-bold uppercase tracking-wider text-sky-300 hover:text-sky-200 cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2">
+                        <span>{showCustomAdder ? '▼' : '▶'}</span>
+                        <span>+ Add Unlisted Food (Auto-Extrapolator)</span>
+                      </span>
+                      <span className="text-[10px] font-mono text-slate-500">4-4-9</span>
+                    </button>
+
+                    {showCustomAdder && (
+                      <div className="pt-2 border-t border-slate-800 space-y-2.5">
+                        <div className="grid grid-cols-4 gap-2">
+  <input
+    type="text" placeholder="Row ID (e.g. HC-23)" value={customEntry.rowId}
+    onChange={(e) => setCustomEntry({ ...customEntry, rowId: e.target.value })}
+    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs font-mono text-emerald-400"
+  />
+  <input
+    type="text" placeholder="Food Name" value={customEntry.name}
+    onChange={(e) => setCustomEntry({ ...customEntry, name: e.target.value })}
+    className="col-span-2 bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-white"
+  />
+                  <select
+                            value={customEntry.category}
+                            onChange={(e) => {
+                              if (e.target.value === '__new__') {
+                                const newCat = prompt('Enter new category name:');
+                                if (newCat && newCat.trim()) setCustomEntry({ ...customEntry, category: newCat.trim() });
+                              } else {
+                                setCustomEntry({ ...customEntry, category: e.target.value });
+                              }
+                            }}
+                            className="bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-xs text-slate-300"
+                          >
+                            {DEFAULT_TAXONOMY.map(cat => <option key={cat} value={cat}>{cat}</option>)}
+                            <option value="__new__">+ Create New Category...</option>
+                          </select>
+                        </div>
+
+                        <div className="grid grid-cols-3 gap-2">
+                          <div>
+                            <label className="block text-[10px] text-slate-400 mb-1">Mode</label>
+                            <select
+                              value={customEntry.targetStorageMode}
+                              onChange={(e) => {
+                                const mode = e.target.value;
+                                setCustomEntry(prev => ({
+                                  ...prev,
+                                  targetStorageMode: mode,
+                                  sourceRefQty: mode === 'unit' ? '1.0' : '100.0',
+                                  consumedNowQty: mode === 'unit' ? '1' : '100.0'
+                                }));
+                              }}
+                              className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-xs text-white"
+                            >
+                              <option value="100g">Per 100g</option>
+                              <option value="100ml">Per 100 ml</option>
+                              <option value="unit">Per 1 Unit</option>
+                            </select>
+                          </div>
+
+                          {!extrapolatedDbPreview.isUnitMode ? (
+                            <div>
+                              <label className="block text-[10px] text-slate-400 mb-1">Source Qty ({customEntry.targetStorageMode === '100ml' ? 'ml' : 'g'})</label>
+                              <input
+                                type="number" step="0.1" value={customEntry.sourceRefQty}
+                                onChange={(e) => setCustomEntry({ ...customEntry, sourceRefQty: e.target.value })}
+                                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-xs font-mono text-amber-300"
+                                title="Package/sample weight in grams or ml"
+                              />
+                            </div>
+                          ) : (
+                            <div>
+                              <label className="block text-[10px] text-slate-400 mb-1">Ref Baseline</label>
+                              <div className="w-full bg-slate-950/50 border border-slate-800 rounded-lg px-2 py-1.5 text-xs font-mono text-slate-400">
+                                1 Piece / Unit
+                              </div>
+                            </div>
+                          )}
+
+                          <div>
+                            <label className="block text-[10px] text-slate-400 mb-1">
+                              {extrapolatedDbPreview.isUnitMode ? 'Units Eaten' : 'Grams Eaten'}
+                            </label>
+                            <input
+                              type="number" step="0.1" value={customEntry.consumedNowQty}
+                              onChange={(e) => setCustomEntry({ ...customEntry, consumedNowQty: e.target.value })}
+                              className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-xs font-mono text-emerald-300"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="flex items-center justify-between text-[10px] text-slate-400 pt-1">
+                          <span>Macros for <strong>{extrapolatedDbPreview.isUnitMode ? '1 Unit' : `${customEntry.sourceRefQty || 100}${customEntry.targetStorageMode === '100ml' ? 'ml' : 'g'}`}</strong>:</span>
+                          <button
+                            type="button"
+                            onClick={handleApplyAtwaterToCustom}
+                            className="px-2 py-0.5 rounded bg-sky-500/15 text-sky-300 border border-sky-500/30 font-mono cursor-pointer"
+                          >
+                            ⚡ Calc 4-4-9 ({extrapolatedDbPreview.atwaterKcal} kcal)
+                          </button>
+                        </div>
+
+                        {/* Consistent Order: kcal, Protein, Carbs, Fat */}
+                        <div className="grid grid-cols-4 gap-1.5">
+                          <div>
+                            <label className="block text-[9px] font-mono text-slate-400 mb-0.5">kcal</label>
+                            <input type="number" step="0.1" placeholder={String(extrapolatedDbPreview.atwaterKcal)} value={customEntry.kcal} onChange={(e) => setCustomEntry({ ...customEntry, kcal: e.target.value })} className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-xs font-mono text-amber-300" />
+                          </div>
+                          <div>
+                            <label className="block text-[9px] font-mono text-slate-400 mb-0.5">Prot (g)</label>
+                            <input type="number" step="0.1" placeholder="0" value={customEntry.protein} onChange={(e) => setCustomEntry({ ...customEntry, protein: e.target.value })} className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-xs font-mono text-sky-300" />
+                          </div>
+                          <div>
+                            <label className="block text-[9px] font-mono text-slate-400 mb-0.5">Carb (g)</label>
+                            <input type="number" step="0.1" placeholder="0" value={customEntry.carbs} onChange={(e) => setCustomEntry({ ...customEntry, carbs: e.target.value })} className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-xs font-mono text-emerald-300" />
+                          </div>
+                          <div>
+                            <label className="block text-[9px] font-mono text-slate-400 mb-0.5">Fat (g)</label>
+                            <input type="number" step="0.1" placeholder="0" value={customEntry.fat} onChange={(e) => setCustomEntry({ ...customEntry, fat: e.target.value })} className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-xs font-mono text-rose-300" />
+                          </div>
+                        </div>
+
+                        <div className="bg-slate-950 border border-slate-800/80 rounded-lg p-2 text-[11px] font-mono text-slate-300 flex justify-between">
+                          <span>Normalized DB Base:</span>
+                          <span className="text-amber-300">{extrapolatedDbPreview.normKcal} kcal | {extrapolatedDbPreview.normP}P | {extrapolatedDbPreview.normC}C | {extrapolatedDbPreview.normF}F</span>
+                        </div>
+
+                        <div className="grid grid-cols-3 gap-1.5 pt-1">
+                          <button
+                            type="button"
+                            onClick={() => handleLogCustomNow(false)}
+                            className="py-2 px-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-semibold border border-slate-700 cursor-pointer"
+                          >
+                            + Log Meal Only
+                          </button>
+                          <button
+                            type="button"
+                            onClick={handleSaveCustomToMasterDbOnly}
+                            className="py-2 px-2 rounded-lg bg-sky-600/20 hover:bg-sky-600/30 text-sky-300 text-[11px] font-semibold border border-sky-500/40 cursor-pointer"
+                          >
+                            + Save DB Only
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleLogCustomNow(true)}
+                            className="py-2 px-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-semibold cursor-pointer"
+                          >
+                            + Log & Save DB
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+		</div>
+                )}
+
+                {/* RIGHT COLUMN: ITEMIZED LOG (Adjusts width automatically based on tab) */}
+                <div className={`${activeTab === 'studio' ? 'lg:col-span-7' : 'col-span-1 max-w-5xl mx-auto w-full'} min-w-0 bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-xl transition-all`}>
+                  
+                  {/* DASHBOARD QUICK ACTION DOCK */}
+                  {activeTab === 'dashboard' && (
+                    <div className="bg-emerald-950/20 border-b border-emerald-900/30 px-4 py-2.5 flex flex-wrap items-center justify-between gap-3">
+                      <span className="text-xs text-emerald-400 font-mono">Day {viewedDayIndex} Locked View</span>
+                      <button
+                        type="button"
+                        onClick={() => setActiveTab('studio')}
+                        className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-bold shadow-lg shadow-emerald-900/20 transition transform hover:scale-105 cursor-pointer"
+                      >
+                        ➕ Open Entry Studio
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="px-4 py-3 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2 bg-slate-900">
+    <div>
+      <span className="text-xs font-bold uppercase tracking-wider text-white">
+        Day {viewedDayIndex} Itemized Log ({currentDayObj.items?.length || 0} items)
+      </span>
+      <p className="text-[11px] text-slate-400">
+        Adjust <strong>Grams / Portions</strong> directly in the table to scale values on the fly.
+      </p>
+    </div>
+  </div>
+
+  <div className="overflow-x-auto">
+    <table className="w-full text-left border-collapse text-xs table-fixed min-w-[340px]">
+                      <thead>
+                        <tr className="border-b border-slate-800 bg-slate-950 text-[10px] sm:text-[11px] text-slate-400 uppercase">
+                          <th className="py-2 px-2 w-[34%] sm:w-[38%]">Item</th>
+                          <th className="py-2 px-1 w-[18%] sm:w-[16%] text-center">Portion</th>
+                          <th className="py-2 px-1.5 text-right w-[12%]">kcal</th>
+                          <th className="py-2 px-1.5 text-right w-[11%]">P</th>
+                          <th className="py-2 px-1.5 text-right w-[11%]">C</th>
+                          <th className="py-2 px-1.5 text-right w-[11%]">F</th>
+                          <th className="py-2 px-0.5 text-center w-[3%]"></th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/50">
+                        {activeMealWindows.map((mw) => {
+                          const items = (currentDayObj.items || []).filter((i) => i.mealWindow === mw.id);
+                          if (!items.length) return null;
+                          const subKcal = items.reduce((s, i) => s + Number(i.kcal || 0), 0);
+                          const subP = items.reduce((s, i) => s + Number(i.protein || 0), 0);
+                          const subC = items.reduce((s, i) => s + Number(i.carbs || 0), 0);
+                          const subF = items.reduce((s, i) => s + Number(i.fat || 0), 0);
+
+                          return (
+                            <React.Fragment key={mw.id}>
+                              {/* 1. SPANNING MEAL WINDOW HEADER ROW */}
+                              <tr className="bg-slate-950/80 border-t-2 border-slate-800">
+                                <td colSpan={7} className="py-2 px-2.5">
+                                  <div className="flex items-center justify-between gap-1 flex-wrap">
+                                    <div className="flex items-center gap-1.5 min-w-0">
+                                      <span className="text-emerald-400 font-bold text-xs truncate">
+                                        🍽 {mw.label}
+                                      </span>
+                                      <button
+                                        type="button"
+                                        onClick={() => handleRenameMealWindow(mw.id, mw.label)}
+                                        className="text-[11px] text-slate-400 hover:text-white px-1 py-0.5 rounded hover:bg-slate-800 cursor-pointer"
+                                        title="Rename Window"
+                                      >
+                                        ✎
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => handleMoveMealWindow(mw.id, 'up')}
+                                        className="text-[10px] text-slate-400 hover:text-white px-1 py-0.5 rounded hover:bg-slate-800 cursor-pointer"
+                                        title="Move Earlier"
+                                      >
+                                        ▲
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => handleMoveMealWindow(mw.id, 'down')}
+                                        className="text-[10px] text-slate-400 hover:text-white px-1 py-0.5 rounded hover:bg-slate-800 cursor-pointer"
+                                        title="Move Later"
+                                      >
+                                        ▼
+                                      </button>
+                                    </div>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleSaveWindowAsPreset(mw.id, mw.label)}
+                                      className="text-[10px] font-mono px-2 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 hover:bg-amber-500/25 cursor-pointer shrink-0"
+                                    >
+                                      ★ Save Preset
+                                    </button>
+                                  </div>
+                                </td>
+                              </tr>
+
+                              {/* 2. ITEM ROWS */}
+                              {items.map((item) => (
+                                <tr key={item.id} className="hover:bg-slate-800/30">
+                                  <td className="py-1.5 px-2.5 text-slate-100 align-middle">
+                                    <div className="font-medium text-slate-200 leading-snug break-words">
+                                      {item.name}
+                                    </div>
+                                    <div className="text-[10px] font-mono text-slate-400 truncate">
+                                      {item.refUnit}
+                                    </div>
+                                  </td>
+                                  <td className="py-1.5 px-1 text-center align-middle">
+                                    <div className="inline-flex items-center justify-center gap-1">
+                                      <input
+                                        type="number"
+                                        step={item.units !== undefined || (item.massG === null && !item.mode?.includes('100')) ? "1" : "0.5"}
+                                        value={item._rawPortionInput !== undefined ? item._rawPortionInput : (item.units !== undefined ? item.units : (item.massG !== null ? item.massG : ''))}
+                                        onChange={(e) => handleInlineRescaleItem(item.id, e.target.value)}
+                                        className="w-14 sm:w-16 bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded px-1 py-0.5 text-center text-xs font-mono text-emerald-300"
+                                      />
+                                      <span className="text-[10px] font-mono text-slate-400">
+                                        {item.units !== undefined ? 'pc' : 'g'}
+                                      </span>
+                                    </div>
+                                  </td>
+                                  <td className="py-1.5 px-1 text-right font-mono text-amber-300 font-semibold align-middle">
+                                    {item.kcal.toFixed(1)}
+                                  </td>
+                                  <td className="py-1.5 px-1 text-right font-mono text-sky-300 align-middle">
+                                    {item.protein.toFixed(1)}
+                                  </td>
+                                  <td className="py-1.5 px-1 text-right font-mono text-emerald-300 align-middle">
+                                    {item.carbs.toFixed(1)}
+                                  </td>
+                                  <td className="py-1.5 px-1 text-right font-mono text-rose-300 align-middle">
+                                    {item.fat.toFixed(1)}
+                                  </td>
+                                  <td className="py-1.5 px-1 text-center align-middle">
+                                    <button
+                                      type="button"
+                                      onClick={() => updateCurrentDay(b => ({ ...b, items: (b.items || []).filter(x => x.id !== item.id) }))}
+                                      className="text-slate-500 hover:text-rose-400 px-1 cursor-pointer font-bold leading-none"
+                                      title="Remove item"
+                                    >
+                                      ✕
+                                    </button>
+                                  </td>
+                                </tr>
+                              ))}
+
+                              {/* 3. ALIGNED SUBTOTAL ROW */}
+                              <tr className="bg-slate-950/60 border-t border-slate-800 text-[10px] font-mono text-slate-400">
+                                <td colSpan={2} className="py-1 px-2 text-right font-medium italic text-slate-400 truncate">
+                                  {mw.label} Subtotal:
+                                </td>
+                                <td className="py-1 px-1.5 text-right text-amber-300/90 font-semibold tabular-nums">{subKcal.toFixed(1)}</td>
+                                <td className="py-1 px-1.5 text-right text-sky-300/90 font-semibold tabular-nums">{subP.toFixed(1)}</td>
+                                <td className="py-1 px-1.5 text-right text-emerald-300/90 font-semibold tabular-nums">{subC.toFixed(1)}</td>
+                                <td className="py-1 px-1.5 text-right text-rose-300/90 font-semibold tabular-nums">{subF.toFixed(1)}</td>
+                                <td></td>
+                              </tr>
+                            </React.Fragment>
+                          );
+                        })}
+                      </tbody>
+                      <tfoot>
+                        <tr className="bg-emerald-950/40 border-t-2 border-emerald-500/40 font-mono text-xs font-bold">
+                          <td colSpan={2} className="py-2.5 px-2 text-emerald-300 truncate">Day {viewedDayIndex} Total</td>
+                          <td className="py-2.5 px-1.5 text-right text-amber-300 tabular-nums">{dailyTotals.kcal.toFixed(1)}</td>
+                          <td className="py-2.5 px-1.5 text-right text-sky-300 tabular-nums">{dailyTotals.protein.toFixed(1)}</td>
+                          <td className="py-2.5 px-1.5 text-right text-emerald-300 tabular-nums">{dailyTotals.carbs.toFixed(1)}</td>
+                          <td className="py-2.5 px-1.5 text-right text-rose-300 tabular-nums">{dailyTotals.fat.toFixed(1)}</td>
+                          <td></td>
+                        </tr>
+                      </tfoot>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* TAB 2: TRAILING HISTORY */}
+            {activeTab === 'trailing' && (
+              <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 overflow-x-auto space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-white">
+                    Trailing 7-Day Window Ending on Day {viewedDayIndex} (7d Weight Avg: {trailingMetrics.avgWeight7d ? `${trailingMetrics.avgWeight7d} kg` : '—'})
+                  </h3>
+                </div>
+                <table className="w-full text-left border-collapse text-xs font-mono">
+                  <thead>
+                    <tr className="border-b border-slate-800 text-slate-400 text-[11px] uppercase">
+                      <th className="py-2.5 px-2.5">Day</th>
+                      <th className="py-2.5 px-2.5">Date</th>
+                      <th className="py-2.5 px-2.5">Label</th>
+                      <th className="py-2.5 px-2 text-right">Weight</th>
+                      <th className="py-2.5 px-2 text-right">kcal</th>
+                      <th className="py-2.5 px-2 text-right">vs 1600</th>
+                      <th className="py-2.5 px-2 text-right">vs TDEE</th>
+                      <th className="py-2.5 px-2 text-right text-sky-400">P (g)</th>
+                      <th className="py-2.5 px-2 text-right text-emerald-400">C (g)</th>
+                      <th className="py-2.5 px-2 text-right text-rose-400">F (g)</th>
+                      <th className="py-2.5 px-2.5">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/60">
+                    {trailingMetrics.sevenDayArray.map((d) => (
+                      <tr
+                        key={d.dayIndex}
+                        onClick={() => setViewedDayIndex(d.dayIndex)}
+                        className={`cursor-pointer transition ${d.isCurrent ? 'bg-emerald-500/15 font-bold' : 'hover:bg-slate-800/50'}`}
+                      >
+                        <td className="py-2.5 px-2.5 text-emerald-300 underline decoration-dotted whitespace-nowrap">Day {d.dayIndex}</td>
+                        <td className="py-2.5 px-2.5 text-slate-400 whitespace-nowrap">{d.dateStr} {d.isWednesday ? '★' : ''}</td>
+                        <td className="py-2.5 px-2.5 font-sans text-slate-200 truncate max-w-[200px]">{d.label}</td>
+                        <td className="py-2.5 px-2 text-right text-slate-300">{d.weightKg ? `${d.weightKg} kg` : '—'}</td>
+                        <td className="py-2.5 px-2 text-right text-amber-300 font-semibold">{d.kcal.toFixed(1)}</td>
+                        <td className="py-2.5 px-2 text-right">{d.deltaCeiling >= 0 ? `+${d.deltaCeiling.toFixed(1)}` : d.deltaCeiling.toFixed(1)}</td>
+                        <td className="py-2.5 px-2 text-right text-emerald-400 font-semibold">{d.preservedDeficit.toFixed(1)}</td>
+                        <td className="py-2.5 px-2 text-right text-sky-300 font-semibold">{d.protein.toFixed(1)}</td>
+                        <td className="py-2.5 px-2 text-right text-emerald-300">{d.carbs.toFixed(1)}</td>
+                        <td className="py-2.5 px-2 text-right text-rose-300">{d.fat.toFixed(1)}</td>
+                        <td className="py-2.5 px-2.5 font-sans whitespace-nowrap">{d.status}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                  <tfoot>
+                    <tr className="bg-slate-950 border-t-2 border-slate-700 font-bold text-slate-200">
+                      <td colSpan={4} className="py-2.5 px-2.5 text-slate-400 uppercase text-[10px]">
+                        7-Day Rolling Avg
+                      </td>
+                      <td className="py-2.5 px-2 text-right text-amber-300 font-bold">{trailingMetrics.avgKcal.toFixed(1)}</td>
+                      <td className="py-2.5 px-2 text-right text-slate-400">
+                        {(trailingMetrics.avgKcal - protocolRules.nominalCeiling).toFixed(1)}
+                      </td>
+                      <td className="py-2.5 px-2 text-right text-emerald-400">{trailingMetrics.avgWeeklyDeficit.toFixed(1)}</td>
+                      <td className="py-2.5 px-2 text-right text-sky-300 font-bold">{trailingMetrics.avgProtein.toFixed(1)}</td>
+                      <td className="py-2.5 px-2 text-right text-emerald-300 font-bold">{trailingMetrics.avgCarbs.toFixed(1)}</td>
+                      <td className="py-2.5 px-2 text-right text-rose-300 font-bold">{trailingMetrics.avgFat.toFixed(1)}</td>
+                      <td className="py-2.5 px-2.5 text-[10px] text-slate-400 font-sans font-normal">
+                        Compliance: {trailingMetrics.weeklyProteinCompliance}%
+                      </td>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
+            )}
+
+            {/* TAB 3: MASTER REFERENCE DB */}
+            {activeTab === 'database' && (
+              <div className="space-y-4">
+                <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <h3 className="text-xs font-bold uppercase tracking-wider text-white">
+                        Consolidated Master Reference Database ({filteredMasterDbView.length} / {masterDb.length} Rows)
+                      </h3>
+                      <p className="text-[11px] text-slate-400">
+                        Filter by category, search by name or Row ID, or click <strong>✎ Edit</strong> to modify macros inline.
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Category Filter Chips */}
+                  <div className="flex gap-1.5 overflow-x-auto pb-1 scrollbar-none">
+                    {categories.map(cat => (
+                      <button
+                        key={cat}
+                        type="button"
+                        onClick={() => setMasterDbCatFilter(cat)}
+                        className={`px-2.5 py-1 rounded-md text-[11px] whitespace-nowrap cursor-pointer transition ${
+                          masterDbCatFilter === cat
+                            ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-semibold'
+                            : 'bg-slate-950 text-slate-400 border border-slate-800 hover:text-white'
+                        }`}
+                      >
+                        {cat}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Live Search Input */}
+                  <div className="relative">
+                    <input
+                      type="text"
+                      value={masterDbSearch}
+                      onChange={(e) => setMasterDbSearch(e.target.value)}
+                      placeholder="Search Master DB by food name, Row ID (e.g. HC-01, P-04), or source..."
+                      className="w-full bg-slate-950 border border-slate-800 focus:border-emerald-500 rounded-lg px-3 py-2 text-xs text-white placeholder-slate-500 focus:outline-none font-mono"
+                    />
+                    {masterDbSearch && (
+                      <button
+                        type="button"
+                        onClick={() => setMasterDbSearch('')}
+                        className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white text-xs cursor-pointer font-bold px-1"
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse text-xs font-mono">
+                    <thead>
+                      <tr className="border-b border-slate-800 text-slate-400 select-none">
+                        {[
+                          { key: 'rowId', label: 'Row ID', align: 'text-left' },
+                          { key: 'category', label: 'Category', align: 'text-left' },
+                          { key: 'name', label: 'Item Name', align: 'text-left' },
+                          { key: 'baseUnit', label: 'Base Unit', align: 'text-left' },
+                          { key: 'kcal', label: 'kcal', align: 'text-right' },
+                          { key: 'protein', label: 'P (g)', align: 'text-right' },
+                          { key: 'carbs', label: 'C (g)', align: 'text-right' },
+                          { key: 'fat', label: 'F (g)', align: 'text-right' },
+                          { key: 'source', label: 'Source', align: 'text-left' }
+                        ].map(col => (
+                          <th
+                            key={col.key}
+                            onClick={() => handleSort(col.key)}
+                            className={`py-2 px-2 ${col.align} hover:text-emerald-300 cursor-pointer transition`}
+                            title={`Sort by ${col.label}`}
+                          >
+                            <span className="inline-flex items-center gap-1">
+                              <span>{col.label}</span>
+                              <span className="text-[10px] text-emerald-400">
+                                {sortConfig.key === col.key ? (sortConfig.direction === 'asc' ? '▲' : '▼') : '↕'}
+                              </span>
+                            </span>
+                          </th>
+                        ))}
+                        <th className="py-2 px-2 text-center">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800/60">
+                      {filteredMasterDbView.map((r) => {
+                        const isEditing = editingRowId === r.id;
+                        if (isEditing) {
+                          return (
+                            <tr key={r.id} className="bg-slate-800/60">
+                              <td className="py-2 px-1"><input value={editDraft.rowId || ''} onChange={e => setEditDraft({ ...editDraft, rowId: e.target.value })} className="w-16 bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-xs text-emerald-300" /></td>
+                              <td className="py-2 px-1">
+                                <select
+                                  value={editDraft.category || ''}
+                                  onChange={e => {
+                                    if (e.target.value === '__new__') {
+                                      const nCat = prompt('Enter new category name:');
+                                      if (nCat && nCat.trim()) setEditDraft({ ...editDraft, category: nCat.trim() });
+                                    } else {
+                                      setEditDraft({ ...editDraft, category: e.target.value });
+                                    }
+                                  }}
+                                  className="w-32 bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-xs text-white"
+                                >
+                                  {categories.filter(c => c !== 'All').map(c => <option key={c} value={c}>{c}</option>)}
+                                  <option value="__new__">+ Create New Category...</option>
+                                </select>
+                              </td>
+                              <td className="py-2 px-1"><input value={editDraft.name || ''} onChange={e => setEditDraft({ ...editDraft, name: e.target.value })} className="w-40 bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-xs text-white" /></td>
+                              <td className="py-2 px-1"><input value={editDraft.baseUnit || ''} onChange={e => setEditDraft({ ...editDraft, baseUnit: e.target.value })} className="w-20 bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-xs text-emerald-300" /></td>
+                              <td className="py-2 px-1"><input type="number" step="0.1" value={editDraft.kcal} onChange={e => setEditDraft({ ...editDraft, kcal: e.target.value })} className="w-16 bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-xs text-right text-amber-300" /></td>
+                              <td className="py-2 px-1"><input type="number" step="0.1" value={editDraft.protein} onChange={e => setEditDraft({ ...editDraft, protein: e.target.value })} className="w-14 bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-xs text-right text-sky-300" /></td>
+                              <td className="py-2 px-1"><input type="number" step="0.1" value={editDraft.carbs} onChange={e => setEditDraft({ ...editDraft, carbs: e.target.value })} className="w-14 bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-xs text-right text-emerald-300" /></td>
+                              <td className="py-2 px-1"><input type="number" step="0.1" value={editDraft.fat} onChange={e => setEditDraft({ ...editDraft, fat: e.target.value })} className="w-14 bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-xs text-right text-rose-300" /></td>
+                              <td className="py-2 px-1"><input value={editDraft.source || ''} onChange={e => setEditDraft({ ...editDraft, source: e.target.value })} className="w-32 bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-xs text-slate-300" /></td>
+                              <td className="py-2 px-1 text-center whitespace-nowrap space-x-1">
+                                <button onClick={handleCalc449InEditDraft} className="px-1.5 py-0.5 rounded bg-sky-500/20 text-sky-300 text-[10px]" title="Calculate kcal via 4-4-9">4-4-9</button>
+                                <button onClick={handleSaveEditRow} className="px-2 py-0.5 rounded bg-emerald-600 text-white text-[11px]">✓</button>
+                                <button onClick={() => setEditingRowId(null)} className="px-1.5 py-0.5 rounded bg-slate-700 text-slate-300 text-[11px]">✕</button>
+                              </td>
+                            </tr>
+                          );
+                        }
+                        return (
+                          <tr key={r.id} className="hover:bg-slate-800/30">
+                            <td className="py-2 px-2 text-emerald-400 font-bold whitespace-nowrap">{r.rowId}</td>
+                            <td className="py-2 px-2 font-sans text-slate-400 text-[11px]">{r.category}</td>
+                            <td className="py-2 px-2 font-sans text-white font-medium">{r.name}</td>
+                            <td className="py-2 px-2 text-emerald-300">{r.baseUnit}</td>
+                            <td className="py-2 px-2 text-right text-amber-300 font-semibold">{Number(r.kcal || 0).toFixed(1)}</td>
+                            <td className="py-2 px-2 text-right text-sky-300">{Number(r.protein || 0).toFixed(1)}</td>
+                            <td className="py-2 px-2 text-right text-emerald-300">{Number(r.carbs || 0).toFixed(1)}</td>
+                            <td className="py-2 px-2 text-right text-rose-300">{Number(r.fat || 0).toFixed(1)}</td>
+                            <td className="py-2 px-2 font-sans text-slate-400 text-[11px]">{r.source}</td>
+                            <td className="py-2 px-2 text-center whitespace-nowrap space-x-1">
+                              <button
+                                onClick={() => handleStartEditRow(r)}
+                                className="px-2 py-0.5 rounded bg-sky-500/15 hover:bg-sky-500/30 text-sky-300 border border-sky-500/30 text-[11px] cursor-pointer"
+                              >
+                                ✎ Edit
+                              </button>
+                              <button
+                                onClick={() => handleDeleteMasterDbRow(r)}
+                                className="px-2 py-0.5 rounded bg-rose-500/15 hover:bg-rose-500/30 text-rose-300 border border-rose-500/30 text-[11px] cursor-pointer"
+                              >
+                                🗑
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+	</div>
+            )}
+
+            {/* TAB 4: MARKDOWN OUTPUT */}
+            {activeTab === 'export' && (
+              <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3">
+                <div className="flex justify-between items-center pb-1">
+                  <span className="text-xs text-slate-400 font-mono">You can highlight and copy any section individually:</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard.writeText(protocolMarkdownReport);
+                      alert('Full Markdown Report copied to clipboard!');
+                    }}
+                    className="px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold cursor-pointer"
+                  >
+                    Copy Full Report
+                  </button>
+                </div>
+                <pre className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs font-mono text-slate-200 overflow-x-auto whitespace-pre-wrap select-text">
+                  {protocolMarkdownReport}
+                </pre>
+              </div>
+            )}
+
+            {/* BOTTOM DANGER ZONE */}
+            <div className="mt-8 border border-rose-950/40 bg-rose-950/10 rounded-xl p-4">
+              <details className="text-xs">
+                <summary className="font-bold text-rose-400 cursor-pointer select-none">
+                  ⚠️ Danger Zone: Day Management & Reset
+                </summary>
+                <div className="mt-3 flex items-center justify-between pt-2 border-t border-rose-950/30">
+                  <span className="text-slate-400 text-xs">Permanently remove Day {viewedDayIndex} data</span>
+                  <button
+                    onClick={() => {
+                      if (confirm(`Permanently delete Day ${viewedDayIndex} and return to Day ${viewedDayIndex - 1}?`)) {
+                        setDaysArchive(prev => { const c = { ...prev }; delete c[viewedDayIndex]; return c; });
+                        setViewedDayIndex(viewedDayIndex - 1);
+                      }
+                    }}
+                    className="px-3 py-1 bg-rose-600/30 text-rose-300 border border-rose-500/40 rounded text-xs font-mono hover:bg-rose-600/50 cursor-pointer"
+                  >
+                    🗑 Delete Day {viewedDayIndex}
+                  </button>
+                </div>
+              </details>
+            </div>
+          </main>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
